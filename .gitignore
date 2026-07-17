@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Local app data (should never be committed)
+*.db
+*.sqlite3
+secret.key
+chrome_profiles/
+logs/
+*.log

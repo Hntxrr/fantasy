@@ -1,0 +1,13 @@
+# GUI
+customtkinter>=5.2
+
+# Browser automation
+selenium>=4.20
+webdriver-manager>=4.0
+
+# Credential encryption at rest (optional but on by default)
+cryptography>=42.0
+keyring>=24.0
+
+# Note: Tkinter ships with the standard CPython installer on Windows/macOS.
+# On some Linux distros install it separately (e.g. `sudo apt install python3-tk`).
