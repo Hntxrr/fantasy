@@ -181,6 +181,7 @@ def _build_wire_driver(profile_dir: str, headless: bool, proxy_info: dict):
         log.info("webdriver-manager unavailable for selenium-wire (%s); using Selenium Manager.", exc)
         driver = wire_webdriver.Chrome(options=opts, seleniumwire_options=sw_options)
     driver.set_page_load_timeout(60)
+    _apply_stealth(driver)  # same anti-detection as the non-proxy path
     return driver
 
 
@@ -210,7 +211,16 @@ def build_driver(
 
     driver = _new_chrome(opts)
     driver.set_page_load_timeout(60)
-    # Extra anti-detection: hide navigator.webdriver.
+    _apply_stealth(driver)
+    return driver
+
+
+def _apply_stealth(driver) -> None:
+    """Hide the navigator.webdriver automation flag (best effort).
+
+    Applied on EVERY driver -- including the selenium-wire (proxy) path -- so
+    logins/pages behave the same with or without a proxy.
+    """
     try:
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",
@@ -218,7 +228,6 @@ def build_driver(
         )
     except Exception:  # pragma: no cover - not fatal
         pass
-    return driver
 
 
 def _new_chrome(opts: Options) -> webdriver.Chrome:
