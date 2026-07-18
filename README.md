@@ -1,8 +1,9 @@
-# RMFantasySMX Pick Bot
+# RapidMoto Fantasy Pick Bot
 
 A standalone desktop app (Python + CustomTkinter) that manages many
 [rmfantasysmx.com](https://www.rmfantasysmx.com) accounts and automates
-submitting weekly fantasy picks with Selenium.
+submitting weekly fantasy picks with Selenium. Clean dark UI with the
+RapidMoto (RM) branding.
 
 It handles everything itself — account storage, rider-name resolution,
 lineup × wildcard assignment math, and concurrent submission — with no external
@@ -24,6 +25,10 @@ tooling required.
   per account, sequentially:
   `20 lineups × 8 wildcards = 160 accounts` → accounts 1–8 get Lineup 1 with
   wildcards 1–8, accounts 9–16 get Lineup 2, and so on.
+- **Start at any account** — pick the account the round begins at from a
+  searchable dropdown (type to filter by label/email). The plan assigns from
+  that account and goes *down* the list, so you can skip accounts already used
+  in a previous round — even if that's account #200 out of 400+.
 - **Concurrent submission** — 1–15 browsers at once, each: log in → select the
   5 place picks + wildcard → submit → confirm → close. Optional launch stagger
   and round-robin proxies to avoid rate-limiting.
@@ -58,9 +63,10 @@ build.bat
 ```
 
 This installs the dependencies + PyInstaller and builds a single-file windowed
-app at `dist\RMFantasyPickBot.exe` using `RMFantasyPickBot.spec`. Double-click
-the exe to run — no Python needed on that machine afterward. (The `.exe` must be
-built *on* Windows; it can't be cross-compiled from Linux/macOS.)
+app at `dist\RapidMotoPickBot.exe` using `RMFantasyPickBot.spec` (which bundles
+the RapidMoto logo and sets the exe icon). Double-click the exe to run — no
+Python needed on that machine afterward. (The `.exe` must be built *on* Windows;
+it can't be cross-compiled from Linux/macOS.)
 
 ---
 
@@ -72,12 +78,18 @@ built *on* Windows; it can't be cross-compiled from Linux/macOS.)
    - Paste **lineups**, one per line, 5 space-separated names
      (`Jett Hunter Haiden Eli Jorge`).
    - Paste **wildcards**, one per line (`Jordan smith`, `Valentine`, …).
+   - **Start at account** — choose which account the round begins at from the
+     dropdown (type to filter). Assignment goes *down* the list from there, so
+     you can skip accounts already used. Leave it on the first account to use
+     them all. **First account** resets it to the top.
    - Click **Scrape riders from site** once (opens a browser using your first
      account to read the current rider roster).
    - Click **Resolve & preview** — check the preview for any `NO MATCH` /
      `AMBIGUOUS` flags and fix those names.
    - Click **Lock in assignments** — builds the account → (lineup, wildcard)
-     plan and shows the math (assigned / idle / unassigned).
+     plan (starting at your chosen account) and shows the math
+     (assigned / idle / unassigned, plus how many accounts were skipped ahead
+     of the start point).
 3. **Run Picks tab** — set your options and hit **RUN PICKS**. Watch the live
    per-account status table.
 4. **History tab** — review results, including which wildcard each account used.
@@ -90,7 +102,7 @@ built *on* Windows; it can't be cross-compiled from Linux/macOS.)
 | **Launch stagger (s)** | Delay between browser launches, to avoid rate-limiting. |
 | **Keep browser open after submit (s)** | Brief pause after a confirmed submit before the (visible) browser closes. Default 0.5s; set to 0 to close instantly, or higher if you want a longer look. |
 | **Headless** | Run without visible windows (faster; no dwell). |
-| **Start from account #** | Begin the run at this row and skip earlier ones — handy if you already submitted some accounts manually. Use **Set from selected row** to fill it from whatever row you click. |
+| **Begin run at** | Dropdown of the locked plan's rows — start the run at this row and skip earlier ones (handy if you already submitted some manually, or want to resume a partial run). Type to filter, or use **Set from selected row** to fill it from whatever row you click. This is a *within-plan* skip; to change which account the plan itself starts at, use **Start at account** on the This Round tab. |
 | **Proxies** | Optional `host:port` per line, assigned round-robin across browsers. |
 | **RUN PICKS / STOP** | Start / cooperatively cancel the run. |
 | **Retry failed** | Re-runs only the accounts whose last result was a failure. |
@@ -114,7 +126,7 @@ Suggested settings from a single home IP:
 | Never had issues, small batch | 4–5 | 3–4 s |
 
 Extra ways to stay under the radar:
-- **Run in batches** with **Start from account #** (e.g. do 20–30, pause a few
+- **Run in batches** with **Begin run at** (e.g. do 20–30, pause a few
   minutes, then continue) instead of blasting all at once.
 - After the **first** successful run, logins are saved in each Chrome profile,
   so later runs skip login = far fewer requests = much less likely to be
@@ -202,16 +214,26 @@ rmfantasy/
   models.py        dataclasses
   repository.py    all data access (accounts, lineups, roster, log, meta)
   resolver.py      fuzzy rider-name resolution
-  assignment.py    cartesian lineup × wildcard → account plan
+  assignment.py    cartesian lineup × wildcard → account plan (with start_offset)
   selectors.py     ALL web selectors (edit here if the site changes)
   automation.py    Selenium: driver, login, scrape, select, submit
   runner.py        ConcurrentRunner (thread pool, stagger, proxies, retries)
   rotation.py      optional per-account wildcard rotation (not used by the
                    cartesian workflow; kept for round-to-round cycling)
   ui/app.py        CustomTkinter app (4 tabs) + thread-safe queue bridge
+  ui/assets/       RapidMoto logo.png + window/exe icons (icon.png, icon.ico)
 main.py            entry point
+tools/generate_logo.py  regenerates the RM logo + icons
 tests/             pytest suite + Xvfb UI smoke test
 ```
+
+### Branding / swapping the logo
+
+The header logo and window/exe icon come from `rmfantasy/ui/assets/`. To use
+your own artwork, replace `logo.png` (a wide transparent PNG looks best). For
+the Windows exe icon, replace `icon.ico`, or drop in a square `icon.png` and run
+`python tools/generate_logo.py` to regenerate the `.ico`. If the assets are
+missing, the app falls back to a simple "RM" text badge — nothing breaks.
 
 Background Selenium work runs on worker threads that never touch Tk widgets
 directly — they push events onto a `queue.Queue` drained by the Tk main loop via
