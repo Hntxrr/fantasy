@@ -1,6 +1,6 @@
 @echo off
 REM =====================================================================
-REM  Build RMFantasyPickBot.exe   (run this on Windows)
+REM  Build RapidMotoPickBot.exe   (run this on Windows)
 REM  Requires: Python 3.10+ installed and on PATH, plus Google Chrome.
 REM =====================================================================
 
@@ -17,7 +17,7 @@ if errorlevel 1 goto :error
 
 echo.
 echo === Done ===
-echo Your app is at:  dist\RMFantasyPickBot.exe
+echo Your app is at:  dist\RapidMotoPickBot.exe
 echo (Double-click it to run. Chrome must be installed.)
 goto :end
 

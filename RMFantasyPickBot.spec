@@ -1,17 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller build spec for the RMFantasySMX Pick Bot.
+"""PyInstaller build spec for the RapidMoto Fantasy Pick Bot.
 
 Build on Windows with:  pyinstaller --noconfirm RMFantasyPickBot.spec
 (or just run build.bat)
 
-Produces a single-file windowed executable in dist\\RMFantasyPickBot.exe.
+Produces a single-file windowed executable in dist\\RapidMotoPickBot.exe.
 CustomTkinter/Selenium/webdriver-manager ship data files and dynamic imports,
 so we collect them explicitly to avoid "module/asset not found" at runtime.
 """
 
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
+# Bundle the RapidMoto logo + icon so the header image and window icon work
+# inside the frozen app (loaded via rmfantasy/ui/assets/ at runtime).
+datas = [("rmfantasy/ui/assets", "rmfantasy/ui/assets")]
 binaries = []
 hiddenimports = []
 
@@ -49,7 +51,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="RMFantasyPickBot",
+    name="RapidMotoPickBot",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -62,4 +64,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon="rmfantasy/ui/assets/icon.ico",   # RapidMoto exe icon
 )
