@@ -132,6 +132,17 @@ def _chrome_options(profile_dir: str, headless: bool) -> Options:
     opts.add_argument("--window-size=1200,860")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
+    # Suppress Chrome's "Save password?" and "Save address?" bubbles -- they're
+    # browser UI that covers the in-page 'Account created' panel, forcing extra
+    # clicks. Turning them off lets you just create/log in and hit the button.
+    opts.add_experimental_option("prefs", {
+        "credentials_enable_service": False,
+        "profile.password_manager_enabled": False,
+        "profile.password_manager_leak_detection": False,
+        "autofill.profile_enabled": False,
+        "autofill.credit_card_enabled": False,
+    })
+    opts.add_argument("--disable-features=AutofillEnableAccountWalletStorage,PasswordManagerOnboarding")
     if headless:
         opts.add_argument("--headless=new")
     return opts
