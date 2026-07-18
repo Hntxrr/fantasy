@@ -11,7 +11,9 @@ webdriver-manager>=4.0
 # The pins avoid known selenium-wire breakages (blinker API + pkg_resources).
 selenium-wire>=5.1
 blinker<1.8
-setuptools>=68
+# selenium-wire needs pkg_resources, which setuptools REMOVED in 81+. Pin below
+# that so the import works ('No module named pkg_resources' otherwise).
+setuptools>=68,<81
 
 # Credential encryption at rest (optional but on by default)
 cryptography>=42.0

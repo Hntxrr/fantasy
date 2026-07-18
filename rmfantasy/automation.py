@@ -147,7 +147,7 @@ def _build_wire_driver(profile_dir: str, headless: bool, proxy_info: dict):
             "Fixes (run in the SAME Python that launches the app):\n"
             "  python -m pip install selenium-wire \"blinker<1.8\" setuptools\n"
             "  - 'No module named seleniumwire'  -> not installed / wrong Python\n"
-            "  - mentions 'pkg_resources'         -> python -m pip install setuptools\n"
+            "  - mentions 'pkg_resources'         -> python -m pip install \"setuptools<81\"\n"
             "  - mentions 'blinker'               -> python -m pip install \"blinker<1.8\"\n"
             "Tip: run  python -m pip show selenium-wire  to confirm where it's installed."
         ) from exc
