@@ -525,3 +525,68 @@ class SigninRunner:
             cb.on_result(account_id, False, str(exc))
         finally:
             repo.close()
+
+
+
+# --------------------------------------------------------------------------- #
+# Login-status verifier (captcha-free)
+# --------------------------------------------------------------------------- #
+class VerifyRunner:
+    """Check which accounts are already logged in and update session_valid.
+
+    Opens each account's profile headlessly and checks for a live session (no
+    login attempt, so no captcha). Marks accounts valid/invalid accordingly.
+    """
+
+    def __init__(
+        self,
+        account_ids: list[int],
+        *,
+        concurrency: int = 4,
+        headless: bool = True,
+        proxies: Optional[list[str]] = None,
+    ) -> None:
+        self.account_ids = list(account_ids)
+        self.concurrency = max(1, min(15, concurrency))
+        self.headless = headless
+        self.proxies = [p for p in (proxies or []) if p.strip()]
+        self._cipher = CredentialCipher()
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def run(self, callbacks: Optional[SigninCallbacks] = None) -> None:
+        cb = callbacks or SigninCallbacks()
+        total = len(self.account_ids)
+        done = 0
+        should_cancel = lambda: self._cancel.is_set() or cb.should_cancel()  # noqa: E731
+        with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
+            futures = {
+                pool.submit(self._verify_one, idx, aid, cb, should_cancel): aid
+                for idx, aid in enumerate(self.account_ids)
+            }
+            for future in as_completed(futures):
+                future.result()
+                done += 1
+                cb.on_progress(done, total)
+
+    def _verify_one(self, index, account_id, cb, should_cancel) -> None:
+        if should_cancel():
+            return
+        cb.on_task_start(account_id)
+        repo = Repository(cipher=self._cipher)
+        try:
+            acc = repo.get_account(account_id, include_password=False)
+            if acc is None:
+                return
+            proxy = self.proxies[index % len(self.proxies)] if self.proxies else None
+            live = False
+            try:
+                live = automation.session_is_live(acc.profile_dir, headless=self.headless, proxy=proxy)
+            except Exception as exc:  # noqa: BLE001
+                cb.on_status(account_id, f"check failed: {exc}")
+            repo.set_session_valid(account_id, live)
+            cb.on_result(account_id, live, "Logged in" if live else "Not logged in")
+        finally:
+            repo.close()

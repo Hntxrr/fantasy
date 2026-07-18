@@ -48,6 +48,7 @@ from ..runner import (
     SigninRunner,
     SignupCallbacks,
     SignupRunner,
+    VerifyRunner,
 )
 from ..signup import US_STATE_NAMES, SignupResult
 
@@ -395,21 +396,23 @@ class App(ctk.CTk):
 
         signin_btns = ctk.CTkFrame(right, fg_color="transparent")
         signin_btns.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 6))
-        self.signin_selected_btn = ctk.CTkButton(
-            signin_btns, text="Log in selected (assist)", fg_color=BRAND,
-            hover_color=BRAND_HOVER, command=self.on_signin_selected,
+        self.open_chrome_btn = ctk.CTkButton(
+            signin_btns, text="Open selected in Chrome (log in)", fg_color=BRAND,
+            hover_color=BRAND_HOVER, command=self.on_open_chrome_login,
         )
-        self.signin_selected_btn.pack(side="left", padx=4)
-        self.signin_loggedout_btn = ctk.CTkButton(
-            signin_btns, text="Log in ALL not-signed-in", fg_color=NEUTRAL,
-            hover_color=NEUTRAL_HOV, command=self.on_signin_logged_out,
+        self.open_chrome_btn.pack(side="left", padx=4)
+        self.refresh_logins_btn = ctk.CTkButton(
+            signin_btns, text="Refresh login status", fg_color=NEUTRAL,
+            hover_color=NEUTRAL_HOV, command=self.on_refresh_logins,
         )
-        self.signin_loggedout_btn.pack(side="left", padx=4)
-        self.signin_stop_btn = ctk.CTkButton(
-            signin_btns, text="Stop", fg_color=DANGER, hover_color=DANGER_HOV,
-            width=70, state="disabled", command=self.on_signin_stop,
-        )
-        self.signin_stop_btn.pack(side="left", padx=4)
+        self.refresh_logins_btn.pack(side="left", padx=4)
+        ctk.CTkLabel(
+            right,
+            text=("Tip: select accounts \u2192 Open in Chrome, log in normally (real browser "
+                  "beats the captcha), close the windows, then Refresh login status. "
+                  "Picks reuse the saved session."),
+            text_color=FG_MUTED, wraplength=460, justify="left", font=ctk.CTkFont(size=11),
+        ).grid(row=4, column=0, sticky="ew", padx=6, pady=(0, 4))
 
     def on_import(self) -> None:
         text = self.import_box.get("1.0", "end")
@@ -477,57 +480,66 @@ class App(ctk.CTk):
         acc = self.repo.get_account(acc_id, include_password=False)
         EditAccountDialog(self, acc_id, acc.label, acc.email)
 
-    # --- Assisted sign-in ------------------------------------------------ #
+    # --- Log in via your real Chrome, then verify ------------------------ #
     def _selected_account_ids(self) -> list[int]:
         return [int(iid) for iid in self.accounts_tree.selection() if iid.isdigit()]
 
-    def on_signin_selected(self) -> None:
+    def on_open_chrome_login(self) -> None:
+        """Open a normal Chrome window per selected account for manual login."""
         ids = self._selected_account_ids()
         if not ids:
-            messagebox.showinfo("No selection", "Select one or more accounts in the list first.")
+            messagebox.showinfo(
+                "No selection",
+                "Select the accounts to log in (Ctrl-click or Shift-click for several).",
+            )
             return
-        self._start_signin(ids)
-
-    def on_signin_logged_out(self) -> None:
-        ids = [a.id for a in self.repo.list_accounts() if not a.session_valid]
-        if not ids:
-            messagebox.showinfo("Nothing to do", "All accounts are already signed in.")
+        if automation.find_chrome_path() is None:
+            messagebox.showerror(
+                "Chrome not found",
+                "Couldn't find Google Chrome. Install it (or tell me the path to "
+                "chrome.exe) and try again.",
+            )
             return
-        if not messagebox.askyesno(
-            "Log in not-signed-in accounts",
-            f"Open {len(ids)} browser(s) to log in? You'll click Log In and clear "
-            f"the captcha in each; sign-in is detected automatically.\n\n"
-            f"(Keep concurrency low so you can handle each window.)",
+        if len(ids) > 15 and not messagebox.askyesno(
+            "Open many windows?",
+            f"This opens {len(ids)} Chrome windows at once - that's a lot to log "
+            f"into by hand. Continue?",
         ):
             return
-        self._start_signin(ids)
-
-    def _start_signin(self, ids: list[int]) -> None:
-        if self.signin_thread and self.signin_thread.is_alive():
-            messagebox.showinfo("Busy", "A sign-in run is already in progress.")
-            return
-        # Reuse the Sign Up tab's concurrency/stagger/proxy settings if present.
-        try:
-            conc = int(self.su_conc_slider.get())
-        except Exception:  # noqa: BLE001
-            conc = 2
-        try:
-            stagger = float(self.su_stagger_entry.get() or "3")
-        except Exception:  # noqa: BLE001
-            stagger = 3.0
-        proxies = [ln.strip() for ln in self.su_proxy_box.get("1.0", "end").splitlines() if ln.strip()]
-        self.signin_runner = SigninRunner(
-            ids, concurrency=conc, launch_stagger=stagger, proxies=proxies,
+        accts = {a.id: a for a in self.repo.list_accounts()}
+        targets = [(accts[i].label, accts[i].profile_dir) for i in ids if i in accts]
+        self.accounts_status.configure(
+            text=f"Opening {len(targets)} Chrome window(s) - log in, then click 'Refresh login status'."
         )
-        self._set_signin_running(True)
-        self.accounts_status.configure(text=f"Signing in {len(ids)} account(s)... 0/{len(ids)}")
-        self.signin_thread = threading.Thread(target=self._signin_worker, args=(ids,), daemon=True)
+        threading.Thread(target=self._open_chrome_worker, args=(targets,), daemon=True).start()
+
+    def _open_chrome_worker(self, targets) -> None:
+        for _label, profile_dir in targets:
+            try:
+                automation.open_profile_browser(profile_dir)
+            except Exception as exc:  # noqa: BLE001
+                self.events.put(("si_error", str(exc)))
+                return
+            time.sleep(1.5)  # small gap so the windows open cleanly
+        self.events.put(("chrome_opened", len(targets)))
+
+    def on_refresh_logins(self) -> None:
+        """Check which accounts have a live session and mark them valid."""
+        if self.signin_thread and self.signin_thread.is_alive():
+            return
+        accts = self.repo.list_accounts()
+        ids = [a.id for a in accts]
+        if not ids:
+            return
+        self.refresh_logins_btn.configure(state="disabled", text="Checking...")
+        self.open_chrome_btn.configure(state="disabled")
+        self.accounts_status.configure(text=f"Checking login status... 0/{len(ids)}")
+        self.signin_runner = VerifyRunner(ids, concurrency=4, headless=True)
+        self.signin_thread = threading.Thread(target=self._refresh_logins_worker, args=(ids,), daemon=True)
         self.signin_thread.start()
 
-    def _signin_worker(self, ids: list[int]) -> None:
+    def _refresh_logins_worker(self, ids) -> None:
         cb = SigninCallbacks(
-            on_task_start=lambda aid: self.events.put(("si_status", aid, "Opening browser...")),
-            on_status=lambda aid, m: self.events.put(("si_status", aid, m)),
             on_result=lambda aid, ok, m: self.events.put(("si_result", aid, ok, m)),
             on_progress=lambda d, t: self.events.put(("si_progress", d, t)),
         )
@@ -536,17 +548,6 @@ class App(ctk.CTk):
             self.events.put(("si_done",))
         except Exception as exc:  # noqa: BLE001
             self.events.put(("si_error", str(exc)))
-
-    def on_signin_stop(self) -> None:
-        if self.signin_runner:
-            self.signin_runner.cancel()
-            self.signin_stop_btn.configure(state="disabled", text="Stopping...")
-
-    def _set_signin_running(self, running: bool) -> None:
-        state = "disabled" if running else "normal"
-        self.signin_selected_btn.configure(state=state)
-        self.signin_loggedout_btn.configure(state=state)
-        self.signin_stop_btn.configure(state="normal" if running else "disabled", text="Stop")
 
     # ================================================================== #
     # Sign Up tab
@@ -1778,25 +1779,26 @@ class App(ctk.CTk):
             self.debug_form_btn.configure(state="normal", text="Debug form")
             self.signup_status_lbl.configure(text="Form dump failed.")
             messagebox.showerror("Debug form failed", str(evt[1]))
-        elif kind == "si_status":
-            acc = self.repo.get_account(evt[1], include_password=False)
-            label = acc.label if acc else f"#{evt[1]}"
-            self.accounts_status.configure(text=f"[{label}] {evt[2]}")
+        elif kind == "chrome_opened":
+            self.accounts_status.configure(
+                text=f"Opened {evt[1]} Chrome window(s). Log in, close them, then "
+                     f"click 'Refresh login status'."
+            )
         elif kind == "si_result":
-            acc = self.repo.get_account(evt[1], include_password=False)
-            label = acc.label if acc else f"#{evt[1]}"
-            self.accounts_status.configure(text=f"[{label}] {evt[3]}")
             self.refresh_accounts()
         elif kind == "si_progress":
-            self.accounts_status.configure(text=f"Signing in... {evt[1]}/{evt[2]}")
+            self.accounts_status.configure(text=f"Checking login status... {evt[1]}/{evt[2]}")
         elif kind == "si_done":
-            self._set_signin_running(False)
+            self.refresh_logins_btn.configure(state="normal", text="Refresh login status")
+            self.open_chrome_btn.configure(state="normal")
             self.refresh_accounts()
-            self.accounts_status.configure(text="Sign-in run finished.")
+            valid = sum(1 for a in self.repo.list_accounts() if a.session_valid)
+            self.accounts_status.configure(text=f"Login check done. {valid} account(s) logged in.")
         elif kind == "si_error":
-            self._set_signin_running(False)
+            self.refresh_logins_btn.configure(state="normal", text="Refresh login status")
+            self.open_chrome_btn.configure(state="normal")
             self.refresh_accounts()
-            messagebox.showerror("Sign-in error", str(evt[1]))
+            messagebox.showerror("Login check error", str(evt[1]))
 
     def _update_run_row(self, account_id: int, status: str, tag: str, remember: bool = True):
         iid = self._run_row_by_account.get(account_id)

@@ -21,6 +21,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
+import subprocess
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -260,6 +263,74 @@ def get_public_ip(driver, timeout: int = 25) -> str:
         except Exception:  # noqa: BLE001
             continue
     return ""
+
+
+# --------------------------------------------------------------------------- #
+# Plain (non-automated) browser launch for manual login
+# --------------------------------------------------------------------------- #
+_CHROME_CANDIDATES = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome",
+]
+
+
+def find_chrome_path() -> Optional[str]:
+    """Locate a real Chrome executable for a plain (non-Selenium) launch."""
+    for cand in _CHROME_CANDIDATES:
+        if os.path.isabs(cand):
+            if os.path.exists(cand):
+                return cand
+        else:
+            found = shutil.which(cand)
+            if found:
+                return found
+    return None
+
+
+def open_profile_browser(profile_dir: str, url: Optional[str] = None) -> None:
+    """Launch a NORMAL Chrome window on ``profile_dir`` (no Selenium/automation).
+
+    This lets you log in like a regular person -- the site's captcha sees a real
+    browser. The session saves into the profile, and later Selenium pick runs
+    reuse it. Raises :class:`AutomationError` if Chrome can't be found.
+    """
+    exe = find_chrome_path()
+    if not exe:
+        raise AutomationError(
+            "Could not find Chrome. Install Google Chrome (or tell me the path "
+            "to chrome.exe)."
+        )
+    args = [
+        exe,
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--new-window",
+        url or config.BASE_URL,
+    ]
+    subprocess.Popen(args)
+
+
+def session_is_live(profile_dir: str, headless: bool = True, proxy: Optional[str] = None) -> bool:
+    """Open the profile briefly (Selenium) and report if it's logged in.
+
+    Captcha-free: it only loads the page and checks for editable rider dropdowns
+    -- it never attempts a login. Used by 'Refresh login status'.
+    """
+    with chrome_session(profile_dir, headless=headless, proxy=proxy) as driver:
+        driver.get(config.BASE_URL)
+        WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        try:
+            WebDriverWait(driver, 15).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except TimeoutException:
+            pass
+        time.sleep(1.0)
+        return is_logged_in(driver)
 
 
 @contextmanager
