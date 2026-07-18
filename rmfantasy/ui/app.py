@@ -408,6 +408,10 @@ class App(ctk.CTk):
             width=70, state="disabled", command=self.on_assist_stop,
         )
         self.assist_stop_btn.pack(side="left", padx=4)
+        ctk.CTkLabel(login_btns, text="Concurrent:").pack(side="left", padx=(10, 2))
+        self.login_conc_entry = ctk.CTkEntry(login_btns, width=48)
+        self.login_conc_entry.insert(0, "5")
+        self.login_conc_entry.pack(side="left", padx=2)
 
         signin_btns = ctk.CTkFrame(right, fg_color="transparent")
         signin_btns.grid(row=4, column=0, sticky="ew", padx=6, pady=(0, 6))
@@ -615,9 +619,10 @@ class App(ctk.CTk):
             messagebox.showinfo("No selection", "Select the accounts to log in.")
             return
         try:
-            conc = int(self.su_conc_slider.get())
+            conc = int(self.login_conc_entry.get() or "5")
         except Exception:  # noqa: BLE001
-            conc = 2
+            conc = 5
+        conc = max(1, min(30, conc))
         try:
             stagger = float(self.su_stagger_entry.get() or "3")
         except Exception:  # noqa: BLE001

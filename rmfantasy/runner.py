@@ -459,7 +459,7 @@ class SigninRunner:
         wait_timeout: int = 600,
     ) -> None:
         self.account_ids = list(account_ids)
-        self.concurrency = max(1, min(15, concurrency))
+        self.concurrency = max(1, min(30, concurrency))
         self.launch_stagger = max(0.0, launch_stagger)
         self.proxies = [p for p in (proxies or []) if p.strip()]
         self.wait_timeout = max(30, wait_timeout)
