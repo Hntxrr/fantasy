@@ -249,6 +249,49 @@ def _new_chrome(opts: Options) -> webdriver.Chrome:
         return webdriver.Chrome(options=opts)
 
 
+def persist_login_cookies(driver, days: int = 400) -> int:
+    """Make session cookies persistent so the login survives closing Chrome.
+
+    Some sites keep you logged in via a *session* cookie (no expiry), which a
+    fresh Selenium profile discards on exit -- so the account looks logged out
+    next time even though nothing expired. Re-adding those cookies with a far
+    expiry makes Chrome write them to disk. Call right after a successful
+    login/signup, while still on the site. Returns how many were converted.
+    """
+    try:
+        cookies = driver.get_cookies()
+    except Exception:  # noqa: BLE001
+        return 0
+    expiry = int(time.time()) + days * 24 * 3600
+    converted = 0
+    for c in cookies:
+        if c.get("expiry"):
+            continue  # already persistent
+        new = {
+            "name": c.get("name"),
+            "value": c.get("value"),
+            "path": c.get("path", "/"),
+            "expiry": expiry,
+        }
+        if c.get("domain"):
+            new["domain"] = c["domain"]
+        if c.get("secure"):
+            new["secure"] = True
+        if c.get("httpOnly"):
+            new["httpOnly"] = True
+        try:
+            driver.add_cookie(new)
+            converted += 1
+        except Exception:  # noqa: BLE001
+            new.pop("domain", None)  # some drivers reject explicit domain
+            try:
+                driver.add_cookie(new)
+                converted += 1
+            except Exception:  # noqa: BLE001
+                pass
+    return converted
+
+
 def get_public_ip(driver, timeout: int = 25) -> str:
     """Return the browser's public IP (via an echo service) to verify a proxy."""
     for url in ("https://api.ipify.org?format=json", "https://ifconfig.me/ip"):
@@ -670,6 +713,9 @@ def do_login(driver, email: str, password: str, timeout: int = 30) -> None:
         # Modal closed but dropdowns not yet enabled; reload once.
         driver.get(config.BASE_URL)
         WebDriverWait(driver, 15).until(lambda d: is_logged_in(d))
+
+    # Keep the login after the browser closes (in case it's a session cookie).
+    persist_login_cookies(driver)
 
 
 def ensure_logged_in(
@@ -1475,7 +1521,8 @@ def assist_signup(
         except Exception:  # noqa: BLE001
             result = ""
         if result == "confirmed":
-            say("You confirmed the account - saving.")
+            say("You confirmed the account - saving session.")
+            persist_login_cookies(driver)  # keep the login after the browser closes
             return
         if result == "skipped":
             raise SignupError("Skipped by you - not saved.")
@@ -1623,6 +1670,7 @@ def assist_login(
 
         if is_logged_in(driver):
             say("Logged in - saving session.")
+            persist_login_cookies(driver)  # keep the login after the browser closes
             return
         try:
             result = driver.execute_script("return window.__rmSignupResult || '';")
@@ -1630,6 +1678,7 @@ def assist_login(
             result = ""
         if result == "confirmed":
             say("You confirmed login - saving session.")
+            persist_login_cookies(driver)
             return
         if result == "skipped":
             raise LoginRequired("Skipped by you.")
