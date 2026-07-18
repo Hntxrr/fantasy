@@ -778,12 +778,27 @@ def _confirm_signup(driver, timeout: int = 30) -> bool:
         return False
 
 
+def _click_submit(driver) -> bool:
+    submit = _find_first_visible(driver, [selectors.SIGNUP_SUBMIT_CSS])
+    if submit is not None:
+        _click(driver, submit)
+        return True
+    return _click_by_text(driver, selectors.SIGNUP_SUBMIT_TEXTS)
+
+
+def _is_fatal_signup_error(text: str) -> bool:
+    t = (text or "").casefold()
+    return any(k in t for k in selectors.SIGNUP_FATAL_ERROR_CONTAINS)
+
+
 def do_signup(
     driver,
     profile: SignupProfile,
     status_cb: Optional[StatusCallback] = None,
     timeout: int = 30,
     post_submit_dwell: float = 4.0,
+    submit_attempts: int = 6,
+    submit_retry_delay: float = 2.5,
 ) -> None:
     """Register a brand-new account from a :class:`SignupProfile`.
 
@@ -857,38 +872,46 @@ def do_signup(
     if not _check_age_radio(driver, selectors.SIGNUP_AGE_OK_LABEL_CONTAINS):
         say("Warning: could not find the '18 or older' option - check SIGNUP_AGE_OK_LABEL_CONTAINS.")
 
-    # Submit.
+    # Submit -- and RETRY the click several times. The site's AJAX
+    # registration is flaky and often reports "verification failed" on the
+    # first press, then goes through on a later one (this mirrors having to
+    # re-click Submit a few times manually). We stop early on a real rejection
+    # (duplicate email, weak password, etc.) or once it's confirmed.
     say("Submitting registration...")
-    submit = _find_first_visible(driver, [selectors.SIGNUP_SUBMIT_CSS])
-    if submit is not None:
-        _click(driver, submit)
-    elif not _click_by_text(driver, selectors.SIGNUP_SUBMIT_TEXTS):
+    if not _click_submit(driver):
         raise SignupError(
             "Could not find the registration Submit button. Check "
             "SIGNUP_SUBMIT_TEXTS / SIGNUP_SUBMIT_CSS in selectors.py."
         )
 
-    # Give the (AJAX) registration request time to actually reach the server
-    # before we inspect the result or close the browser.
-    time.sleep(2.0)
+    confirmed = False
+    last_error = ""
+    attempts = max(1, submit_attempts)
+    for attempt in range(1, attempts + 1):
+        # Short per-attempt wait for a success signal (modal closes / logged
+        # in / success text).
+        if _confirm_signup(driver, timeout=6):
+            confirmed = True
+            break
+        # Inspect any inline error; bail out if it's clearly not retryable.
+        err = _find_first_visible(driver, [selectors.SIGNUP_ERROR_CSS])
+        etext = " ".join(err.text.split()) if err and (err.text or "").strip() else ""
+        if etext:
+            last_error = etext
+            if _is_fatal_signup_error(etext):
+                raise SignupError(f"Registration rejected: {etext[:200]}")
+        if attempt < attempts:
+            say(f"Not confirmed yet - re-submitting (try {attempt + 1}/{attempts})...")
+            time.sleep(submit_retry_delay)
+            _click_submit(driver)
 
-    # Surface an inline validation error the form shows on a rejected submit
-    # (e.g. weak password, duplicate email, missing required field).
-    err = _find_first_visible(driver, [selectors.SIGNUP_ERROR_CSS])
-    if err is not None and (err.text or "").strip():
-        raise SignupError(f"Registration rejected: {' '.join(err.text.split())[:200]}")
-
-    say("Confirming registration...")
-    confirmed = _confirm_signup(driver, timeout=timeout)
-
-    # Keep the browser open a moment AFTER submitting so the account-creation
-    # request finishes -- closing too quickly can cancel it in flight, which
-    # looks like "it submitted but no account was made".
+    # Keep the browser open a moment so the account-creation request finishes.
     if post_submit_dwell > 0:
-        say(f"Submitted - holding browser open {post_submit_dwell:g}s to finish...")
         time.sleep(post_submit_dwell)
 
     if not confirmed:
-        err = _find_first_visible(driver, [selectors.SIGNUP_ERROR_CSS])
-        detail = f" Site said: {' '.join(err.text.split())[:200]}" if err and (err.text or "").strip() else ""
-        raise SignupError(f"Registration submitted but not confirmed.{detail}")
+        detail = f" Site said: {last_error[:200]}" if last_error else ""
+        raise SignupError(
+            f"Registration not confirmed after {attempts} submit attempts.{detail} "
+            f"Try increasing 'Submit attempts', or the site may be rate-limiting."
+        )

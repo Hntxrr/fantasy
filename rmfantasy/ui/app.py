@@ -537,14 +537,19 @@ class App(ctk.CTk):
         self.su_stagger_entry.insert(0, "6")
         self.su_stagger_entry.grid(row=0, column=4, padx=4)
 
-        ctk.CTkLabel(opts, text="Keep browser open after submit (s):").grid(row=0, column=5, padx=(8, 4))
-        self.su_keepopen_entry = ctk.CTkEntry(opts, width=54)
+        ctk.CTkLabel(opts, text="Keep open after submit (s):").grid(row=0, column=5, padx=(8, 4))
+        self.su_keepopen_entry = ctk.CTkEntry(opts, width=48)
         self.su_keepopen_entry.insert(0, "5")
         self.su_keepopen_entry.grid(row=0, column=6, padx=4)
 
+        ctk.CTkLabel(opts, text="Submit attempts:").grid(row=0, column=7, padx=(8, 4))
+        self.su_attempts_entry = ctk.CTkEntry(opts, width=48)
+        self.su_attempts_entry.insert(0, "6")
+        self.su_attempts_entry.grid(row=0, column=8, padx=4)
+
         self.su_headless_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(opts, text="Headless", variable=self.su_headless_var
-                        ).grid(row=0, column=7, padx=12)
+                        ).grid(row=0, column=9, padx=12, sticky="e")
 
         ctk.CTkLabel(opts, text="Proxies (one host:port per line, optional; round-robin):"
                      ).grid(row=1, column=0, columnspan=8, sticky="w", padx=8, pady=(4, 0))
@@ -658,6 +663,10 @@ class App(ctk.CTk):
             keep_open = float(self.su_keepopen_entry.get() or "5")
         except ValueError:
             keep_open = 5.0
+        try:
+            attempts = int(self.su_attempts_entry.get() or "6")
+        except ValueError:
+            attempts = 6
         proxies = [ln.strip() for ln in self.su_proxy_box.get("1.0", "end").splitlines() if ln.strip()]
 
         self.signup_runner = SignupRunner(
@@ -670,6 +679,7 @@ class App(ctk.CTk):
             launch_stagger=stagger,
             proxies=proxies,
             post_submit_dwell=keep_open,
+            submit_attempts=attempts,
         )
         self.signup_progress.set(0)
         self.signup_progress_lbl.configure(text=f"0 / {len(emails)}")

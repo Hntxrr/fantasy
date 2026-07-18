@@ -131,7 +131,8 @@ def _fake_session(profile_dir, headless=False, proxy=None):
     yield object()
 
 
-def _fake_do_signup(driver, profile, status_cb=None, timeout=30, post_submit_dwell=0):
+def _fake_do_signup(driver, profile, status_cb=None, timeout=30, post_submit_dwell=0,
+                    submit_attempts=6, submit_retry_delay=0):
     if status_cb:
         status_cb("mock: filling form")
     if profile.email.startswith("fail"):

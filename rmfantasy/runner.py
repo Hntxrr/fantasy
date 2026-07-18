@@ -289,6 +289,7 @@ class SignupRunner:
         proxies: Optional[list[str]] = None,
         signup_timeout: int = 45,
         post_submit_dwell: float = 4.0,
+        submit_attempts: int = 6,
     ) -> None:
         self.city = city
         self.state = state
@@ -300,6 +301,7 @@ class SignupRunner:
         self.proxies = [p for p in (proxies or []) if p.strip()]
         self.signup_timeout = signup_timeout
         self.post_submit_dwell = max(0.0, post_submit_dwell)
+        self.submit_attempts = max(1, submit_attempts)
 
         self._cipher = CredentialCipher()
         self._launch_lock = threading.Lock()
@@ -384,6 +386,7 @@ class SignupRunner:
                     driver, profile, status_cb=status,
                     timeout=self.signup_timeout,
                     post_submit_dwell=self.post_submit_dwell,
+                    submit_attempts=self.submit_attempts,
                 )
 
             # Registered and saved to Accounts, but left as "not signed in" so

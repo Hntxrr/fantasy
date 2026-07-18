@@ -89,6 +89,12 @@ SIGNUP_ERROR_CSS = (
     ".signup .error, .registration .error, .parsley-errors-list, "
     ".alert-danger, .field-error"
 )
+# Error phrases that mean "don't bother retrying" (a resubmit won't help).
+# Anything else (e.g. a transient "verification failed") is retried.
+SIGNUP_FATAL_ERROR_CONTAINS = [
+    "already", "exists", "taken", "in use", "registered", "invalid email",
+    "must be at least", "too short", "too weak",
+]
 # Text that (defensively) signals a successful registration.
 SIGNUP_SUCCESS_TEXT_CONTAINS = [
     "welcome",
