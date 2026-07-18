@@ -142,8 +142,14 @@ def _build_wire_driver(profile_dir: str, headless: bool, proxy_info: dict):
         from seleniumwire import webdriver as wire_webdriver
     except Exception as exc:  # noqa: BLE001
         raise AutomationError(
-            "Authenticated proxies need the 'selenium-wire' package. Install it:\n"
-            "    pip install selenium-wire \"blinker<1.8\" setuptools"
+            "Authenticated proxy needs 'selenium-wire', but importing it failed:\n"
+            f"    {type(exc).__name__}: {exc}\n\n"
+            "Fixes (run in the SAME Python that launches the app):\n"
+            "  python -m pip install selenium-wire \"blinker<1.8\" setuptools\n"
+            "  - 'No module named seleniumwire'  -> not installed / wrong Python\n"
+            "  - mentions 'pkg_resources'         -> python -m pip install setuptools\n"
+            "  - mentions 'blinker'               -> python -m pip install \"blinker<1.8\"\n"
+            "Tip: run  python -m pip show selenium-wire  to confirm where it's installed."
         ) from exc
 
     from urllib.parse import quote
