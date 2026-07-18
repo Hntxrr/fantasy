@@ -5,6 +5,14 @@ customtkinter>=5.2
 selenium>=4.20
 webdriver-manager>=4.0
 
+# Authenticated proxy support (host:port:user:pass) on the Sign Up tab.
+# selenium-wire runs a local relay that injects the proxy credentials, which
+# works on modern Chrome where the old proxy-auth extension no longer does.
+# The pins avoid known selenium-wire breakages (blinker API + pkg_resources).
+selenium-wire>=5.1
+blinker<1.8
+setuptools>=68
+
 # Credential encryption at rest (optional but on by default)
 cryptography>=42.0
 keyring>=24.0

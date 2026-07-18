@@ -246,6 +246,14 @@ confirmation detected":
   text, the 18+ label text, and the submit label. Verify these on your first
   live sign-up; they're best-effort guesses from the form layout.
 
+### Proxies (Sign Up / Run Picks)
+
+Proxy lines accept `host:port` (open) or `host:port:user:pass` (authenticated).
+Authenticated proxies are routed through **selenium-wire** (installed via
+`requirements.txt`), which works on current Chrome. Use the **Test proxy**
+button on the Sign Up tab to confirm the browser's public IP is the proxy's and
+not your own before running a batch.
+
 ---
 
 ## Architecture

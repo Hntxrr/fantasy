@@ -21,10 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import tempfile
 import time
-import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
@@ -120,47 +117,65 @@ def parse_proxy(raw: Optional[str]) -> Optional[dict]:
     return None
 
 
-def _make_proxy_auth_extension(host: str, port: str, user: str, password: str) -> str:
-    """Write a tiny Chrome extension that applies an authenticated proxy.
+def _chrome_options(profile_dir: str, headless: bool) -> Options:
+    opts = Options()
+    opts.add_argument(f"--user-data-dir={profile_dir}")
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--no-default-browser-check")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--window-size=1200,860")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    if headless:
+        opts.add_argument("--headless=new")
+    return opts
 
-    Plain ``--proxy-server`` can't carry credentials, so we generate a small
-    extension that sets the proxy and answers the auth challenge. Returns the
-    path to a packed ``.zip`` suitable for ``options.add_extension``.
+
+def _build_wire_driver(profile_dir: str, headless: bool, proxy_info: dict):
+    """Create a selenium-wire Chrome that authenticates an upstream proxy.
+
+    selenium-wire runs a local relay Chrome connects to; it forwards traffic to
+    the real (authenticated) proxy and supplies the credentials. This works on
+    current Chrome, unlike the old proxy-auth extension.
     """
-    manifest = {
-        "version": "1.0.0",
-        "manifest_version": 2,
-        "name": "RM Proxy Auth",
-        "permissions": [
-            "proxy", "tabs", "unlimitedStorage", "storage",
-            "<all_urls>", "webRequest", "webRequestBlocking",
-        ],
-        "background": {"scripts": ["background.js"]},
-        "minimum_chrome_version": "22.0.0",
-    }
-    background = """
-var config = {
-  mode: "fixed_servers",
-  rules: {
-    singleProxy: { scheme: "http", host: "%(host)s", port: parseInt("%(port)s") },
-    bypassList: ["localhost"]
-  }
-};
-chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
-function callbackFn(details) {
-  return { authCredentials: { username: "%(user)s", password: "%(pass)s" } };
-}
-chrome.webRequest.onAuthRequired.addListener(
-  callbackFn, { urls: ["<all_urls>"] }, ['blocking']
-);
-""" % {"host": host, "port": port, "user": user, "pass": password}
+    try:
+        from seleniumwire import webdriver as wire_webdriver
+    except Exception as exc:  # noqa: BLE001
+        raise AutomationError(
+            "Authenticated proxies need the 'selenium-wire' package. Install it:\n"
+            "    pip install selenium-wire \"blinker<1.8\" setuptools"
+        ) from exc
 
-    tmp_dir = tempfile.mkdtemp(prefix="rm_proxy_auth_")
-    zip_path = os.path.join(tmp_dir, "proxy_auth.zip")
-    with zipfile.ZipFile(zip_path, "w") as zf:
-        zf.writestr("manifest.json", json.dumps(manifest))
-        zf.writestr("background.js", background)
-    return zip_path
+    from urllib.parse import quote
+    user = quote(proxy_info["user"], safe="")
+    pw = quote(proxy_info["pass"], safe="")
+    proxy_url = f"http://{user}:{pw}@{proxy_info['host']}:{proxy_info['port']}"
+    sw_options = {
+        "proxy": {
+            "http": proxy_url,
+            "https": proxy_url,
+            "no_proxy": "localhost,127.0.0.1",
+        },
+        "verify_ssl": False,
+    }
+
+    opts = _chrome_options(profile_dir, headless)
+    # selenium-wire is a MITM relay; accept its generated cert to avoid warnings.
+    opts.add_argument("--ignore-certificate-errors")
+
+    try:
+        from selenium.webdriver.chrome.service import Service
+        from webdriver_manager.chrome import ChromeDriverManager
+
+        service = Service(ChromeDriverManager().install())
+        driver = wire_webdriver.Chrome(
+            service=service, options=opts, seleniumwire_options=sw_options
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.info("webdriver-manager unavailable for selenium-wire (%s); using Selenium Manager.", exc)
+        driver = wire_webdriver.Chrome(options=opts, seleniumwire_options=sw_options)
+    driver.set_page_load_timeout(60)
+    return driver
 
 
 # --------------------------------------------------------------------------- #
@@ -170,42 +185,22 @@ def build_driver(
     profile_dir: str,
     headless: bool = False,
     proxy: Optional[str] = None,
-) -> webdriver.Chrome:
+):
     """Create a Chrome driver bound to an isolated profile directory.
 
-    ChromeDriver is resolved via webdriver-manager when available, otherwise
-    Selenium 4's built-in Selenium Manager. ``proxy`` may be ``host:port`` or
-    ``host:port:user:pass`` (authenticated proxies use a generated extension).
+    ``proxy`` may be ``host:port`` (open) or ``host:port:user:pass``
+    (authenticated -> routed through selenium-wire). ChromeDriver is resolved
+    via webdriver-manager when available, otherwise Selenium Manager.
     """
-    opts = Options()
-    opts.add_argument(f"--user-data-dir={profile_dir}")
-    opts.add_argument("--no-first-run")
-    opts.add_argument("--no-default-browser-check")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--window-size=1200,860")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-
     proxy_info = parse_proxy(proxy)
-    if proxy_info:
-        if proxy_info["user"]:
-            # Authenticated proxy -> credentials via a generated extension.
-            try:
-                ext = _make_proxy_auth_extension(
-                    proxy_info["host"], proxy_info["port"],
-                    proxy_info["user"], proxy_info["pass"],
-                )
-                opts.add_extension(ext)
-                if headless:
-                    log.warning("Authenticated proxy + headless can be unreliable; "
-                                "run sign-ups with Headless OFF if the proxy fails.")
-            except Exception:  # noqa: BLE001
-                log.exception("Failed to build proxy-auth extension; continuing without proxy")
-        else:
-            opts.add_argument(f"--proxy-server={proxy_info['host']}:{proxy_info['port']}")
 
-    if headless:
-        opts.add_argument("--headless=new")
+    # Authenticated proxy: use selenium-wire (modern-Chrome friendly).
+    if proxy_info and proxy_info["user"]:
+        return _build_wire_driver(profile_dir, headless, proxy_info)
+
+    opts = _chrome_options(profile_dir, headless)
+    if proxy_info:  # open proxy, no credentials
+        opts.add_argument(f"--proxy-server={proxy_info['host']}:{proxy_info['port']}")
 
     driver = _new_chrome(opts)
     driver.set_page_load_timeout(60)
