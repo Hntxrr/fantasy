@@ -89,12 +89,16 @@ Need fresh accounts? On the **Sign Up** tab:
    time to finish before the window closes), then click **SIGN UP ALL**.
 
 For each email the bot generates a random first/last name, phone, nickname,
-strong password and street address, ticks *"I am 18 or older"*, and submits the
-form. On success the `email:password` is appended to `signups.txt` (see *Where
-data lives*) and the account is added to **Accounts** as *not signed in* (it
-sits at the bottom of the list until a login/pick run confirms the session).
-Emails that already exist as accounts are skipped; a signup that fails is rolled
-back (no orphan account).
+strong password and street address, and ticks *"I am 18 or older"*.
+
+The site's **Submit is a Google reCAPTCHA button**, so a human must clear it.
+By default **Assist mode** is on: the bot fills the form and scrolls to Submit,
+then **you** click Submit + clear the captcha in the browser and click the
+**"Account created"** button in the little panel it injects (top-right). That
+saves the `email:password` to `signups.txt`, adds the account to **Accounts**
+(as *not signed in*, so it sits at the bottom), and closes the browser. Skipping
+or closing the window discards it. Keep concurrency low (1-2) so you can handle
+each browser. Emails that already exist as accounts are skipped.
 
 > The registration form is located by field **placeholder/label text** (not the
 > site's volatile Wicket ids). If the site changes its wording, tweak the

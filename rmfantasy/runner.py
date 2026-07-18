@@ -290,6 +290,8 @@ class SignupRunner:
         signup_timeout: int = 45,
         post_submit_dwell: float = 4.0,
         submit_attempts: int = 8,
+        assist: bool = True,
+        assist_timeout: int = 600,
     ) -> None:
         self.city = city
         self.state = state
@@ -302,6 +304,11 @@ class SignupRunner:
         self.signup_timeout = signup_timeout
         self.post_submit_dwell = max(0.0, post_submit_dwell)
         self.submit_attempts = max(1, submit_attempts)
+        # Assist mode: fill the form, then the user clicks Submit + clears the
+        # reCAPTCHA and confirms via the in-browser panel (default; the site's
+        # Submit is a reCAPTCHA button so full automation can't clear it).
+        self.assist = assist
+        self.assist_timeout = max(30, assist_timeout)
 
         self._cipher = CredentialCipher()
         self._launch_lock = threading.Lock()
@@ -379,15 +386,24 @@ class SignupRunner:
                 repo.delete_account(account.id)
                 return SignupResult(email, False, "Cancelled.")
 
+            # Assist mode forces a visible browser (the user interacts with it).
+            headless = self.headless and not self.assist
             with automation.chrome_session(
-                account.profile_dir, headless=self.headless, proxy=proxy
+                account.profile_dir, headless=headless, proxy=proxy
             ) as driver:
-                automation.do_signup(
-                    driver, profile, status_cb=status,
-                    timeout=self.signup_timeout,
-                    post_submit_dwell=self.post_submit_dwell,
-                    submit_attempts=self.submit_attempts,
-                )
+                if self.assist:
+                    automation.assist_signup(
+                        driver, profile, status_cb=status,
+                        timeout=self.signup_timeout,
+                        wait_timeout=self.assist_timeout,
+                    )
+                else:
+                    automation.do_signup(
+                        driver, profile, status_cb=status,
+                        timeout=self.signup_timeout,
+                        post_submit_dwell=self.post_submit_dwell,
+                        submit_attempts=self.submit_attempts,
+                    )
 
             # Registered and saved to Accounts, but left as "not signed in" so
             # it appears at the BOTTOM of the list until a real login/pick run

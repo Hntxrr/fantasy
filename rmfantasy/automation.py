@@ -1094,40 +1094,28 @@ def _is_fatal_signup_error(text: str) -> bool:
     return any(k in t for k in selectors.SIGNUP_FATAL_ERROR_CONTAINS)
 
 
-def do_signup(
-    driver,
-    profile: SignupProfile,
-    status_cb: Optional[StatusCallback] = None,
-    timeout: int = 30,
-    post_submit_dwell: float = 4.0,
-    submit_attempts: int = 8,
-    submit_retry_delay: float = 3.0,
-    pre_submit_delay: float = 3.0,
-) -> None:
-    """Register a brand-new account from a :class:`SignupProfile`.
-
-    Opens the registration modal, fills every field (random identity + shared
-    address, country defaulting to the United States), ticks "I am 18 or
-    older", and submits. Raises :class:`SignupError` if the form can't be found
-    or the registration isn't confirmed. The browser profile is persisted by
-    the caller so the freshly-created session stays logged in.
-    """
-    say = status_cb or (lambda _m: None)
-
+def _open_and_fill(driver, profile: SignupProfile, say, timeout: int) -> None:
+    """Open the registration modal and fill every field + tick 18+."""
     driver.get(config.BASE_URL)
     WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    # Let the (JS-rendered) header/buttons settle before we hunt for Sign Up.
-    time.sleep(1.0)
+    # Wait for the page to actually finish loading (slow residential proxies)
+    # before hunting for the Sign Up button.
+    try:
+        WebDriverWait(driver, 25).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+    except TimeoutException:
+        pass
+    time.sleep(1.5)
 
-    # Open the "new player -> SIGN UP" modal (unless it's already showing).
     say("Opening sign-up form...")
     if not _open_signup_modal(driver, timeout=timeout):
         seen = _visible_click_texts(driver)
         hint = (", ".join(seen) if seen else "(no buttons detected)")
         raise SignupError(
             "Could not open the sign-up form. The buttons/links I could see were: "
-            f"[{hint}]. Tell me which one opens sign-up (or share this) so the "
-            "SIGNUP_OPEN_TEXTS in selectors.py can be set exactly."
+            f"[{hint}]. (If the site was still loading, try a lower concurrency "
+            "or a faster proxy.)"
         )
 
     scope = _signup_scope(driver)
@@ -1175,6 +1163,126 @@ def do_signup(
     say("Confirming 18+...")
     if not _check_age_radio(driver, selectors.SIGNUP_AGE_OK_LABEL_CONTAINS):
         say("Warning: could not find the '18 or older' option - check SIGNUP_AGE_OK_LABEL_CONTAINS.")
+
+
+def _inject_assist_overlay(driver) -> None:
+    """Inject a small in-page panel with 'Account created' / 'Skip' buttons."""
+    js = r"""
+    (function(){
+      if (document.getElementById('__rm_assist')) return;
+      var d = document.createElement('div');
+      d.id = '__rm_assist';
+      d.style.cssText = 'position:fixed;top:12px;right:12px;z-index:2147483647;'
+        + 'background:#14161f;color:#f2f4f8;padding:14px 16px;border:2px solid #2f6bff;'
+        + 'border-radius:12px;font-family:Segoe UI,Arial,sans-serif;'
+        + 'box-shadow:0 8px 30px rgba(0,0,0,.55);max-width:260px';
+      d.innerHTML =
+        '<div style="font-weight:700;margin-bottom:6px">RapidMoto sign-up</div>'
+        + '<div style="font-size:12px;line-height:1.45;margin-bottom:10px;color:#9aa3b2">'
+        + '1) Click <b>Submit</b> and clear the captcha.<br>'
+        + '2) Once the account is created, click below.</div>'
+        + '<button id="__rm_ok" style="background:#22c55e;color:#fff;border:0;'
+        + 'padding:9px 12px;border-radius:7px;cursor:pointer;font-weight:700;margin-right:6px">'
+        + 'Account created \u2713</button>'
+        + '<button id="__rm_skip" style="background:#ef4444;color:#fff;border:0;'
+        + 'padding:9px 12px;border-radius:7px;cursor:pointer;font-weight:700">Skip</button>';
+      document.body.appendChild(d);
+      if (typeof window.__rmSignupResult === 'undefined') window.__rmSignupResult = '';
+      document.getElementById('__rm_ok').onclick = function(){
+        window.__rmSignupResult = 'confirmed';
+        d.innerHTML = '<div style="font-weight:700">Saving account &amp; closing...</div>';
+      };
+      document.getElementById('__rm_skip').onclick = function(){
+        window.__rmSignupResult = 'skipped';
+        d.innerHTML = '<div style="font-weight:700">Skipped.</div>';
+      };
+    })();
+    """
+    try:
+        driver.execute_script(js)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def assist_signup(
+    driver,
+    profile: SignupProfile,
+    status_cb: Optional[StatusCallback] = None,
+    timeout: int = 30,
+    wait_timeout: int = 600,
+) -> None:
+    """Fill the form, scroll to Submit, then wait for YOU to finish.
+
+    The registration Submit is a Google reCAPTCHA button, so a human completes
+    it. We fill every field, scroll to Submit, and show an in-page panel with an
+    "Account created" button. When you click it (after submitting + clearing the
+    captcha in the browser), this returns and the caller saves the account.
+    Raises :class:`SignupError` if you Skip, close the window, or time out.
+    """
+    say = status_cb or (lambda _m: None)
+    _open_and_fill(driver, profile, say, timeout)
+
+    # Scroll the Submit button into view so it's easy to click.
+    btn = _find_submit_button(driver)
+    if btn is not None:
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+        except Exception:  # noqa: BLE001
+            pass
+
+    _inject_assist_overlay(driver)
+    say("Filled. In the browser: click Submit, clear the captcha, then click "
+        "'Account created' (top-right box).")
+
+    deadline = time.time() + wait_timeout
+    while time.time() < deadline:
+        try:
+            if not driver.window_handles:
+                raise SignupError("Browser was closed before you confirmed - not saved.")
+        except SignupError:
+            raise
+        except Exception:  # noqa: BLE001
+            raise SignupError("Browser was closed before you confirmed - not saved.")
+
+        try:
+            result = driver.execute_script("return window.__rmSignupResult || '';")
+        except Exception:  # noqa: BLE001
+            result = ""
+        if result == "confirmed":
+            say("You confirmed the account - saving.")
+            return
+        if result == "skipped":
+            raise SignupError("Skipped by you - not saved.")
+
+        # Re-inject the panel if a page reload/navigation removed it.
+        try:
+            if not driver.execute_script("return !!document.getElementById('__rm_assist');"):
+                _inject_assist_overlay(driver)
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(0.6)
+
+    raise SignupError("Timed out waiting for you to confirm the account - not saved.")
+
+
+def do_signup(
+    driver,
+    profile: SignupProfile,
+    status_cb: Optional[StatusCallback] = None,
+    timeout: int = 30,
+    post_submit_dwell: float = 4.0,
+    submit_attempts: int = 8,
+    submit_retry_delay: float = 3.0,
+    pre_submit_delay: float = 3.0,
+) -> None:
+    """Register a brand-new account from a :class:`SignupProfile` (auto submit).
+
+    Note: on sites where Submit is a reCAPTCHA button, use ``assist_signup``
+    instead -- a human must clear the captcha.
+    """
+    say = status_cb or (lambda _m: None)
+
+    _open_and_fill(driver, profile, say, timeout)
 
     # A short human-like pause BEFORE submitting. The form is filled very fast,
     # and submitting instantly is what trips the site's "verification failed".

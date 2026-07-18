@@ -145,7 +145,7 @@ _runnermod.automation.do_signup = _fake_do_signup
 before = app2.repo.count_accounts()
 sr = _runnermod.SignupRunner(
     city="Provo", state="Utah", postal_code="84601",
-    concurrency=1, launch_stagger=0, post_submit_dwell=0,
+    concurrency=1, launch_stagger=0, post_submit_dwell=0, assist=False,
 )
 results = {r.email: r for r in sr.run(["new1@ex.com", "fail2@ex.com", "user0@ex.com"])}
 print("signup success (expect True):",

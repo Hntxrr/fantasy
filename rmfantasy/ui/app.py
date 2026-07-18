@@ -547,9 +547,13 @@ class App(ctk.CTk):
         self.su_attempts_entry.insert(0, "8")
         self.su_attempts_entry.grid(row=0, column=8, padx=4)
 
+        self.su_assist_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            opts, text="Assist mode (I click Submit + captcha)",
+            variable=self.su_assist_var,
+        ).grid(row=0, column=9, padx=12, sticky="e")
+
         self.su_headless_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(opts, text="Headless", variable=self.su_headless_var
-                        ).grid(row=0, column=9, padx=12, sticky="e")
 
         ctk.CTkLabel(opts, text="Proxies (one per line: host:port OR host:port:user:pass; round-robin):"
                      ).grid(row=1, column=0, columnspan=8, sticky="w", padx=8, pady=(4, 0))
@@ -558,9 +562,11 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(
             opts,
-            text=("Go gentle from one IP: 1-2 concurrent with a 6-10s stagger. "
-                  "New account submissions from the same IP are exactly what "
-                  "trips rate limits, so slower is safer here."),
+            text=("Assist mode (recommended): the form is auto-filled and scrolled to "
+                  "Submit; YOU click Submit and clear the site's captcha, then click "
+                  "'Account created' in the little box in the browser - it saves the "
+                  "account and closes. Keep concurrency low (1-2) so you can handle "
+                  "each browser."),
             text_color=FG_MUTED, wraplength=1040, justify="left",
         ).grid(row=3, column=0, columnspan=8, sticky="w", padx=8, pady=(0, 8))
 
@@ -690,6 +696,7 @@ class App(ctk.CTk):
             proxies=proxies,
             post_submit_dwell=keep_open,
             submit_attempts=attempts,
+            assist=self.su_assist_var.get(),
         )
         self.signup_progress.set(0)
         self.signup_progress_lbl.configure(text=f"0 / {len(emails)}")
