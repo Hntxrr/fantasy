@@ -266,6 +266,24 @@ class Repository:
         return {r["query"]: r["rider"] for r in rows}
 
     # ------------------------------------------------------------------ #
+    # Round lifecycle
+    # ------------------------------------------------------------------ #
+    def reset_round(self) -> None:
+        """Clear the current round for a fresh week.
+
+        Removes: round lineup/wildcard text, the locked plan, per-account run
+        statuses, and the submission history.
+        Preserves: accounts (always) and saved name overrides (aliases).
+        """
+        for key in (
+            "round_lineups_text", "round_wildcards_text",
+            "round_plan_json", "round_status_json",
+        ):
+            self.conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+        self.conn.execute("DELETE FROM submission_log")
+        self.conn.commit()
+
+    # ------------------------------------------------------------------ #
     # Lineups
     # ------------------------------------------------------------------ #
     def add_lineup(self, name: str, riders: list[str]) -> Lineup:

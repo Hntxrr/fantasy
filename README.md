@@ -78,10 +78,33 @@ built *on* Windows; it can't be cross-compiled from Linux/macOS.)
      `AMBIGUOUS` flags and fix those names.
    - Click **Lock in assignments** — builds the account → (lineup, wildcard)
      plan and shows the math (assigned / idle / unassigned).
-3. **Run Picks tab** — set concurrency (default 10), optional stagger/proxies,
-   then **RUN PICKS**. Watch the live per-account status; **STOP** cancels
-   cooperatively.
+3. **Run Picks tab** — set your options and hit **RUN PICKS**. Watch the live
+   per-account status table.
 4. **History tab** — review results, including which wildcard each account used.
+
+### Run Picks tab controls
+
+| Control | What it does |
+|---------|--------------|
+| **Concurrent browsers** (1–15) | How many accounts run at once. |
+| **Launch stagger (s)** | Delay between browser launches, to avoid rate-limiting. |
+| **Keep browser open after submit (s)** | Leaves the (visible) browser open this long after a confirmed submit so you can *see* it worked before it closes. Default 3s. |
+| **Headless** | Run without visible windows (faster; no dwell). |
+| **Start from account #** | Begin the run at this row and skip earlier ones — handy if you already submitted some accounts manually. Use **Set from selected row** to fill it from whatever row you click. |
+| **Proxies** | Optional `host:port` per line, assigned round-robin across browsers. |
+| **RUN PICKS / STOP** | Start / cooperatively cancel the run. |
+| **Retry failed** | Re-runs only the accounts whose last result was a failure. |
+| **👁 Watch selected** | Opens a real browser for the selected account (also: double-click a row) so you can watch/verify it. Use when a run isn't active. |
+| **Reset round** | Clears the round for a fresh week — see below. |
+
+### What persists (and Reset round)
+
+Everything about the current round is saved and **survives closing the app**:
+lineups, wildcards, the locked plan, the Run Picks table (with each account's
+last status), and the submission History. It all stays until you click
+**Reset round**, which clears the round and history for a new week. Your
+**accounts** and **saved name overrides** are always kept (only *Clear ALL
+accounts* removes accounts).
 
 ---
 

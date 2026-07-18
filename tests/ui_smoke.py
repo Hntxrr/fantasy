@@ -55,12 +55,42 @@ print("preview head:", app.preview_box.get("1.0", "end").strip().splitlines()[0]
 lus, wcs = app._pending_resolved
 plan = build_plan(lus, wcs, app.repo.list_accounts())
 app.plan = plan
+app._run_status = {}
+app._persist_plan()
+app._persist_status()
 app._populate_run_table()
 print("plan:", plan.summary())
 print("run rows:", len(app.run_tree.get_children()))
-print("history rows:", len(app.history_tree.get_children()))
+
+# Simulate a couple of run results + a start-offset skip, then persist.
+first_id = plan.assignments[0].account_id
+second_id = plan.assignments[1].account_id
+app._update_run_row(first_id, "Picks submitted and confirmed.", "ok")
+app._update_run_row(second_id, "Failed after 2 attempts: timeout", "fail")
+app._persist_status()
+print("read options:", app._read_run_options())
 
 app.update()
-app.after(50, app.destroy)
-app.mainloop()
+# Close via the real close handler (persists round text + plan + statuses).
+app._on_close()
+
+# --- Simulate an app restart: a fresh App with the same RMFANTASY_HOME. ---
+app2 = App()
+print("restart: plan loaded:", app2.plan is not None)
+print("restart: run rows:", len(app2.run_tree.get_children()))
+print("restart: lineups restored:", bool(app2.lineups_box.get("1.0", "end").strip()))
+restored = app2._run_status.get(first_id)
+print("restart: first account status restored:", restored)
+print("restart: history rows:", len(app2.history_tree.get_children()))
+
+# --- Reset round: clears round + history, keeps accounts. ---
+app2.on_reset_round()
+print("after reset: plan:", app2.plan)
+print("after reset: run rows:", len(app2.run_tree.get_children()))
+print("after reset: accounts kept:", app2.repo.count_accounts())
+print("after reset: alias kept:", app2.repo.get_aliases())
+
+app2.update()
+app2.after(50, app2.destroy)
+app2.mainloop()
 print("UI SMOKE OK")

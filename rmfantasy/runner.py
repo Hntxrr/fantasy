@@ -76,6 +76,7 @@ class ConcurrentRunner:
         login_timeout: int = 30,
         submit_retries: int = 2,
         retry_delay: float = 3.0,
+        post_submit_dwell: float = 3.0,
     ) -> None:
         self.concurrency = max(1, min(15, concurrency))
         self.headless = headless
@@ -84,6 +85,9 @@ class ConcurrentRunner:
         self.login_timeout = login_timeout
         self.submit_retries = max(1, submit_retries)
         self.retry_delay = retry_delay
+        # Seconds to keep the (visible) browser open after a successful submit
+        # so you can actually see the confirmation before it closes.
+        self.post_submit_dwell = max(0.0, post_submit_dwell)
 
         self._cipher = CredentialCipher()  # shared; Fernet ops are stateless
         self._launch_lock = threading.Lock()
@@ -203,6 +207,10 @@ class ConcurrentRunner:
             round_label = automation.get_round_label(driver)
             driver.get(automation.config.BASE_URL)
             automation.submit_picks(driver, request, status_cb=status, verify=True)
+            # Linger on the confirmation so it's visibly submitted (visible mode only).
+            if self.post_submit_dwell > 0 and not self.headless:
+                status(f"Submitted & confirmed - keeping browser open {int(self.post_submit_dwell)}s...")
+                time.sleep(self.post_submit_dwell)
         return self._finish(
             assignment, True, "Picks submitted and confirmed.", repo, round_label=round_label
         )

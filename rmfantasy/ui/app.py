@@ -18,15 +18,18 @@ connection (connections are not shareable across threads).
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
+import time
 import tkinter as tk
+from dataclasses import asdict
 from tkinter import messagebox, ttk
 
 import customtkinter as ctk
 
 from .. import automation, config
-from ..assignment import AssignmentPlan, build_plan
+from ..assignment import AssignmentPlan, RoundAssignment, build_plan
 from ..repository import Repository
 from ..resolver import RiderResolver
 from ..runner import ConcurrentRunner, RunCallbacks, RunResult
@@ -35,6 +38,31 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
 PAD = 8
+
+
+def _plan_to_dict(plan: AssignmentPlan) -> dict:
+    """Serialize an AssignmentPlan for persistence between app runs."""
+    return {
+        "lineup_count": plan.lineup_count,
+        "wildcard_count": plan.wildcard_count,
+        "pairs_needed": plan.pairs_needed,
+        "accounts_available": plan.accounts_available,
+        "unassigned_pairs": [list(p) for p in plan.unassigned_pairs],
+        "idle_accounts": list(plan.idle_accounts),
+        "assignments": [asdict(a) for a in plan.assignments],
+    }
+
+
+def _plan_from_dict(d: dict) -> AssignmentPlan:
+    return AssignmentPlan(
+        assignments=[RoundAssignment(**a) for a in d.get("assignments", [])],
+        lineup_count=d.get("lineup_count", 0),
+        wildcard_count=d.get("wildcard_count", 0),
+        pairs_needed=d.get("pairs_needed", 0),
+        accounts_available=d.get("accounts_available", 0),
+        unassigned_pairs=[tuple(p) for p in d.get("unassigned_pairs", [])],
+        idle_accounts=list(d.get("idle_accounts", [])),
+    )
 
 
 class App(ctk.CTk):
@@ -56,6 +84,8 @@ class App(ctk.CTk):
         self.scrape_thread: threading.Thread | None = None
         self.runner: ConcurrentRunner | None = None
         self._run_row_by_account: dict[int, str] = {}
+        self._run_status: dict[int, tuple] = {}   # account_id -> (status_text, tag)
+        self._watch_threads: list = []
 
         self._style_treeview()
 
@@ -76,7 +106,7 @@ class App(ctk.CTk):
         self.refresh_history()
 
         # Start the UI event pump.
-        self.after(100, self._drain_events)
+        self._drain_after_id = self.after(100, self._drain_events)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ================================================================== #
@@ -398,7 +428,10 @@ class App(ctk.CTk):
             messagebox.showwarning("No accounts", "Import accounts before locking in a plan.")
             return
         self.plan = build_plan(resolved_lineups, resolved_wildcards, accounts)
+        self._run_status = {}
         self._persist_round()
+        self._persist_plan()
+        self._persist_status()
         self._populate_run_table()
         warn = ""
         if self.plan.unassigned_pairs:
@@ -452,40 +485,67 @@ class App(ctk.CTk):
 
         opts = ctk.CTkFrame(tab)
         opts.grid(row=0, column=0, sticky="ew", padx=PAD, pady=PAD)
-        opts.grid_columnconfigure(6, weight=1)
+        opts.grid_columnconfigure(7, weight=1)
 
         ctk.CTkLabel(opts, text="Concurrent browsers:").grid(row=0, column=0, padx=(8, 4), pady=8)
         self.conc_value = ctk.CTkLabel(opts, text="10", width=28)
-        self.conc_slider = ctk.CTkSlider(opts, from_=1, to=15, number_of_steps=14, width=180,
+        self.conc_slider = ctk.CTkSlider(opts, from_=1, to=15, number_of_steps=14, width=150,
                                          command=lambda v: self.conc_value.configure(text=str(int(v))))
         self.conc_slider.set(10)
         self.conc_slider.grid(row=0, column=1, padx=4)
         self.conc_value.grid(row=0, column=2, padx=(0, 12))
 
         ctk.CTkLabel(opts, text="Launch stagger (s):").grid(row=0, column=3, padx=(8, 4))
-        self.stagger_entry = ctk.CTkEntry(opts, width=60)
+        self.stagger_entry = ctk.CTkEntry(opts, width=54)
         self.stagger_entry.insert(0, "1.0")
         self.stagger_entry.grid(row=0, column=4, padx=4)
 
+        ctk.CTkLabel(opts, text="Keep browser open after submit (s):").grid(row=0, column=5, padx=(8, 4))
+        self.keepopen_entry = ctk.CTkEntry(opts, width=54)
+        self.keepopen_entry.insert(0, "3")
+        self.keepopen_entry.grid(row=0, column=6, padx=4)
+
         self.headless_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(opts, text="Headless", variable=self.headless_var).grid(row=0, column=5, padx=12)
+        ctk.CTkCheckBox(opts, text="Headless", variable=self.headless_var
+                        ).grid(row=0, column=7, padx=12, sticky="e")
+
+        ctk.CTkLabel(opts, text="Start from account #:").grid(row=1, column=0, padx=(8, 4), pady=(0, 6), sticky="w")
+        self.start_entry = ctk.CTkEntry(opts, width=70)
+        self.start_entry.insert(0, "1")
+        self.start_entry.grid(row=1, column=1, padx=4, pady=(0, 6), sticky="w")
+        ctk.CTkButton(opts, text="Set from selected row", width=150,
+                      command=self.on_set_start_from_selected
+                      ).grid(row=1, column=2, columnspan=2, padx=4, pady=(0, 6), sticky="w")
+        ctk.CTkLabel(opts, text="(skips accounts before this position - useful if you already did some)",
+                     text_color="#9aa").grid(row=1, column=4, columnspan=4, padx=4, pady=(0, 6), sticky="w")
 
         ctk.CTkLabel(opts, text="Proxies (one host:port per line, optional; round-robin):"
-                     ).grid(row=1, column=0, columnspan=6, sticky="w", padx=8)
-        self.proxy_box = ctk.CTkTextbox(opts, height=50)
-        self.proxy_box.grid(row=2, column=0, columnspan=7, sticky="ew", padx=8, pady=(0, 8))
+                     ).grid(row=2, column=0, columnspan=8, sticky="w", padx=8)
+        self.proxy_box = ctk.CTkTextbox(opts, height=44)
+        self.proxy_box.grid(row=3, column=0, columnspan=8, sticky="ew", padx=8, pady=(0, 8))
 
         actions = ctk.CTkFrame(tab, fg_color="transparent")
         actions.grid(row=1, column=0, sticky="ew", padx=PAD)
         self.run_btn = ctk.CTkButton(actions, text="RUN PICKS", fg_color="#2c6e49",
-                                     hover_color="#358257", height=40, width=160,
+                                     hover_color="#358257", height=40, width=130,
                                      font=ctk.CTkFont(size=15, weight="bold"), command=self.on_run)
         self.run_btn.pack(side="left", padx=4)
+        self.retry_btn = ctk.CTkButton(actions, text="Retry failed", fg_color="#7a5a1e",
+                                       hover_color="#8f6a26", height=40, width=100,
+                                       command=self.on_retry_failed)
+        self.retry_btn.pack(side="left", padx=4)
         self.stop_btn = ctk.CTkButton(actions, text="STOP", fg_color="#8a2c2c",
-                                      hover_color="#a13636", height=40, width=100,
+                                      hover_color="#a13636", height=40, width=80,
                                       state="disabled", command=self.on_stop)
         self.stop_btn.pack(side="left", padx=4)
-        self.progress = ctk.CTkProgressBar(actions, width=360)
+        self.watch_btn = ctk.CTkButton(actions, text="\U0001F441 Watch selected", width=140, height=40,
+                                       command=self.on_watch_selected)
+        self.watch_btn.pack(side="left", padx=4)
+        self.reset_btn = ctk.CTkButton(actions, text="Reset round", fg_color="#555555",
+                                       hover_color="#666666", height=40, width=100,
+                                       command=self.on_reset_round)
+        self.reset_btn.pack(side="left", padx=4)
+        self.progress = ctk.CTkProgressBar(actions, width=220)
         self.progress.set(0)
         self.progress.pack(side="left", padx=12)
         self.progress_lbl = ctk.CTkLabel(actions, text="0 / 0")
@@ -496,17 +556,15 @@ class App(ctk.CTk):
         wrap.grid(row=2, column=0, sticky="nsew", padx=PAD, pady=PAD)
         wrap.grid_rowconfigure(0, weight=1)
         wrap.grid_columnconfigure(0, weight=1)
-        self.run_tree = ttk.Treeview(
-            wrap, columns=("lineup", "wildcard", "status"), show="tree headings"
-        )
-        self.run_tree.heading("#0", text="Account")
-        self.run_tree.heading("lineup", text="Lineup")
-        self.run_tree.heading("wildcard", text="Wildcard")
-        self.run_tree.heading("status", text="Status")
-        self.run_tree.column("#0", width=180)
-        self.run_tree.column("lineup", width=80, anchor="center")
-        self.run_tree.column("wildcard", width=160)
-        self.run_tree.column("status", width=420)
+        cols = ("num", "account", "lineup", "wildcard", "status")
+        self.run_tree = ttk.Treeview(wrap, columns=cols, show="headings")
+        for c, w, t, anchor in [
+            ("num", 50, "#", "center"), ("account", 180, "Account", "w"),
+            ("lineup", 70, "Lineup", "center"), ("wildcard", 150, "Wildcard", "w"),
+            ("status", 430, "Status", "w"),
+        ]:
+            self.run_tree.heading(c, text=t)
+            self.run_tree.column(c, width=w, anchor=anchor)
         vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.run_tree.yview)
         self.run_tree.configure(yscrollcommand=vsb.set)
         self.run_tree.grid(row=0, column=0, sticky="nsew")
@@ -514,6 +572,9 @@ class App(ctk.CTk):
         self.run_tree.tag_configure("ok", foreground="#7fdf7f")
         self.run_tree.tag_configure("fail", foreground="#ff8a8a")
         self.run_tree.tag_configure("busy", foreground="#ffd27f")
+        self.run_tree.tag_configure("skip", foreground="#888888")
+        # Double-click a row = open a browser to watch that account.
+        self.run_tree.bind("<Double-1>", lambda e: self.on_watch_selected())
 
     def _populate_run_table(self):
         for iid in self.run_tree.get_children():
@@ -521,13 +582,29 @@ class App(ctk.CTk):
         self._run_row_by_account.clear()
         if not self.plan:
             return
-        for a in self.plan.assignments:
+        for pos, a in enumerate(self.plan.assignments, 1):
             iid = f"acc{a.account_id}"
             self._run_row_by_account[a.account_id] = iid
+            st = self._run_status.get(a.account_id)
+            status_text = st[0] if st else "Pending"
+            tag = st[1] if st and st[1] else ""
             self.run_tree.insert(
-                "", "end", iid=iid, text=a.account_label,
-                values=(f"#{a.lineup_index}", a.wildcard, "Pending"),
+                "", "end", iid=iid,
+                values=(pos, a.account_label, f"#{a.lineup_index}", a.wildcard, status_text),
+                tags=(tag,) if tag else (),
             )
+
+    def _read_run_options(self):
+        try:
+            stagger = float(self.stagger_entry.get() or "1.0")
+        except ValueError:
+            stagger = 1.0
+        try:
+            keep_open = float(self.keepopen_entry.get() or "3")
+        except ValueError:
+            keep_open = 3.0
+        proxies = [ln.strip() for ln in self.proxy_box.get("1.0", "end").splitlines() if ln.strip()]
+        return stagger, keep_open, proxies
 
     def on_run(self):
         if self.run_thread and self.run_thread.is_alive():
@@ -535,29 +612,146 @@ class App(ctk.CTk):
         if not self.plan or not self.plan.assignments:
             messagebox.showwarning("No plan", "Lock in a plan on the 'This Round' tab first.")
             return
+        assignments = list(self.plan.assignments)
         try:
-            stagger = float(self.stagger_entry.get() or "1.0")
+            start = int(self.start_entry.get() or "1")
         except ValueError:
-            stagger = 1.0
-        proxies = [ln.strip() for ln in self.proxy_box.get("1.0", "end").splitlines() if ln.strip()]
+            start = 1
+        start = max(1, min(start, len(assignments)))
+        active = assignments[start - 1:]
+        # Reset row states: mark skipped ones before the start, others Pending.
+        for i, a in enumerate(assignments):
+            if i < start - 1:
+                self._update_run_row(a.account_id, "Skipped (start offset)", "skip")
+            else:
+                self._update_run_row(a.account_id, "Pending", "")
+        self._persist_status()
+        self._launch_run(active)
 
-        self._populate_run_table()
+    def on_retry_failed(self):
+        if self.run_thread and self.run_thread.is_alive():
+            return
+        if not self.plan:
+            messagebox.showwarning("No plan", "Nothing to retry yet.")
+            return
+        failed = {aid for aid, st in self._run_status.items() if st and st[1] == "fail"}
+        subset = [a for a in self.plan.assignments if a.account_id in failed]
+        if not subset:
+            messagebox.showinfo("Nothing to retry", "There are no failed accounts to retry.")
+            return
+        for a in subset:
+            self._update_run_row(a.account_id, "Pending (retry)", "")
+        self._persist_status()
+        self._launch_run(subset)
+
+    def _launch_run(self, assignments):
+        stagger, keep_open, proxies = self._read_run_options()
         self.progress.set(0)
-        self.progress_lbl.configure(text=f"0 / {len(self.plan.assignments)}")
-        self.run_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
-
+        self.progress_lbl.configure(text=f"0 / {len(assignments)}")
+        self._set_running(True)
         self.runner = ConcurrentRunner(
             concurrency=int(self.conc_slider.get()),
             headless=self.headless_var.get(),
             launch_stagger=stagger,
             proxies=proxies,
+            post_submit_dwell=keep_open,
         )
-        assignments = list(self.plan.assignments)
         self.run_thread = threading.Thread(
-            target=self._run_worker, args=(assignments,), daemon=True
+            target=self._run_worker, args=(list(assignments),), daemon=True
         )
         self.run_thread.start()
+
+    def on_set_start_from_selected(self):
+        sel = self.run_tree.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select a row in the table first.")
+            return
+        num = self.run_tree.set(sel[0], "num")
+        self.start_entry.delete(0, "end")
+        self.start_entry.insert(0, str(num))
+
+    def on_watch_selected(self):
+        if self.run_thread and self.run_thread.is_alive():
+            messagebox.showinfo(
+                "Run in progress",
+                "Finish/stop the run before opening a browser - the account "
+                "profiles are in use while a run is going.",
+            )
+            return
+        sel = self.run_tree.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select an account row, then click the eye (or double-click a row).")
+            return
+        iid = sel[0]
+        if not iid.startswith("acc"):
+            return
+        account_id = int(iid[3:])
+        self._update_run_row(account_id, "Opening browser...", "busy", remember=False)
+        t = threading.Thread(target=self._watch_worker, args=(account_id,), daemon=True)
+        self._watch_threads.append(t)
+        t.start()
+
+    def _watch_worker(self, account_id: int):
+        repo = Repository()
+        try:
+            acc = repo.get_account(account_id, include_password=True)
+            if acc is None:
+                self.events.put(("watch_error", account_id, "Account not found."))
+                return
+            driver = automation.build_driver(acc.profile_dir, headless=False)
+            try:
+                automation.ensure_logged_in(
+                    driver, acc.email, acc.password,
+                    status_cb=lambda m: self.events.put(("watch_status", account_id, m)),
+                )
+                driver.get(config.BASE_URL)
+                self.events.put(("watch_status", account_id, "Browser open - close the window when done."))
+                # Keep the session alive until the user closes the window.
+                while True:
+                    try:
+                        if not driver.window_handles:
+                            break
+                    except Exception:
+                        break
+                    time.sleep(1.0)
+            finally:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+            self.events.put(("watch_status", account_id, "Browser closed."))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("watch_error", account_id, str(exc)))
+        finally:
+            repo.close()
+
+    def on_reset_round(self):
+        if self.run_thread and self.run_thread.is_alive():
+            messagebox.showinfo("Run in progress", "Stop the run before resetting the round.")
+            return
+        if not messagebox.askyesno(
+            "Reset round",
+            "Start a fresh round?\n\n"
+            "CLEARS: lineups & wildcards, the locked plan, the Run Picks table, "
+            "and the submission History.\n\n"
+            "KEEPS: your accounts and saved name overrides.\n\n"
+            "(Until you reset here, everything stays put across app restarts.)",
+        ):
+            return
+        self.repo.reset_round()
+        self.plan = None
+        self._run_status = {}
+        for iid in self.run_tree.get_children():
+            self.run_tree.delete(iid)
+        self._run_row_by_account.clear()
+        self.lineups_box.delete("1.0", "end")
+        self.wildcards_box.delete("1.0", "end")
+        self._set_preview("")
+        self.round_summary.configure(text="")
+        self.progress.set(0)
+        self.progress_lbl.configure(text="0 / 0")
+        self.refresh_history()
+        messagebox.showinfo("Round reset", "Cleared. Set up the new round on the 'This Round' tab.")
 
     def _run_worker(self, assignments):
         cb = RunCallbacks(
@@ -576,6 +770,12 @@ class App(ctk.CTk):
         if self.runner:
             self.runner.cancel()
             self.stop_btn.configure(state="disabled", text="Stopping...")
+
+    def _set_running(self, running: bool):
+        state = "disabled" if running else "normal"
+        for btn in (self.run_btn, self.retry_btn, self.watch_btn, self.reset_btn):
+            btn.configure(state=state)
+        self.stop_btn.configure(state="normal" if running else "disabled", text="STOP")
 
     # ================================================================== #
     # History tab
@@ -628,6 +828,16 @@ class App(ctk.CTk):
         self.repo.set_meta("round_lineups_text", self.lineups_box.get("1.0", "end").strip())
         self.repo.set_meta("round_wildcards_text", self.wildcards_box.get("1.0", "end").strip())
 
+    def _persist_plan(self):
+        if self.plan:
+            self.repo.set_meta("round_plan_json", json.dumps(_plan_to_dict(self.plan)))
+
+    def _persist_status(self):
+        self.repo.set_meta(
+            "round_status_json",
+            json.dumps({str(k): list(v) for k, v in self._run_status.items()}),
+        )
+
     def _load_persisted(self):
         lu = self.repo.get_meta("round_lineups_text")
         wc = self.repo.get_meta("round_wildcards_text")
@@ -640,6 +850,24 @@ class App(ctk.CTk):
             self.roster_lbl.configure(
                 text=f"Roster: {len(roster)} riders (updated {self.repo.roster_updated_at()})"
             )
+        # Restore per-account run statuses (survives restart until Reset round).
+        self._run_status = {}
+        status_json = self.repo.get_meta("round_status_json")
+        if status_json:
+            try:
+                self._run_status = {int(k): tuple(v) for k, v in json.loads(status_json).items()}
+            except Exception:
+                self._run_status = {}
+        # Restore the locked plan + repopulate the Run Picks table.
+        plan_json = self.repo.get_meta("round_plan_json")
+        if plan_json:
+            try:
+                self.plan = _plan_from_dict(json.loads(plan_json))
+            except Exception:
+                self.plan = None
+        if self.plan:
+            self._populate_run_table()
+            self.round_summary.configure(text=self.plan.summary())
 
     # ================================================================== #
     # Event pump (runs on the Tk main thread)
@@ -651,7 +879,7 @@ class App(ctk.CTk):
                 self._handle_event(evt)
         except queue.Empty:
             pass
-        self.after(100, self._drain_events)
+        self._drain_after_id = self.after(100, self._drain_events)
 
     def _handle_event(self, evt):
         kind = evt[0]
@@ -675,32 +903,52 @@ class App(ctk.CTk):
             r: RunResult = evt[1]
             self._update_run_row(r.account_id, status=r.message,
                                  tag="ok" if r.success else "fail")
+            self._persist_status()
         elif kind == "progress":
             done, total = evt[1], evt[2]
             self.progress.set(done / total if total else 0)
             self.progress_lbl.configure(text=f"{done} / {total}")
+        elif kind == "watch_status":
+            self._update_run_row(evt[1], status=evt[2], tag="busy", remember=False)
+        elif kind == "watch_error":
+            self._update_run_row(evt[1], status=f"Browser error: {evt[2]}", tag="fail", remember=False)
+            messagebox.showerror("Browser error", evt[2])
         elif kind == "run_done":
             self._on_run_finished()
         elif kind == "run_error":
             self._on_run_finished()
             messagebox.showerror("Run error", evt[1])
 
-    def _update_run_row(self, account_id: int, status: str, tag: str):
+    def _update_run_row(self, account_id: int, status: str, tag: str, remember: bool = True):
         iid = self._run_row_by_account.get(account_id)
         if iid and self.run_tree.exists(iid):
             self.run_tree.set(iid, "status", status)
-            self.run_tree.item(iid, tags=(tag,))
+            self.run_tree.item(iid, tags=(tag,) if tag else ())
+        # ``remember`` keeps the persisted round state clean (watch actions
+        # update only the visible row, not the saved per-account result).
+        if remember:
+            self._run_status[account_id] = (status, tag)
 
     def _on_run_finished(self):
-        self.run_btn.configure(state="normal")
-        self.stop_btn.configure(state="disabled", text="STOP")
+        self._set_running(False)
+        self._persist_status()
         self.refresh_accounts()
         self.refresh_history()
 
     def _on_close(self):
         try:
+            # Stop the event pump so no pending timer fires after destroy().
+            if getattr(self, "_drain_after_id", None):
+                try:
+                    self.after_cancel(self._drain_after_id)
+                except Exception:
+                    pass
             if self.runner:
                 self.runner.cancel()
+            # Persist the round so nothing is lost on close (cleared only by Reset round).
+            self._persist_round()
+            self._persist_plan()
+            self._persist_status()
             self.repo.close()
         finally:
             self.destroy()

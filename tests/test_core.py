@@ -265,6 +265,33 @@ def test_roster_and_meta(repo):
     assert repo.get_meta("missing", "default") == "default"
 
 
+def test_reset_round(repo):
+    # Seed a full round: accounts, round text, plan/status meta, an alias, and a log.
+    repo.bulk_import_accounts("a@x.com:1\nb@x.com:2")
+    repo.set_meta("round_lineups_text", "Jett Hunter Haiden Eli Jorge")
+    repo.set_meta("round_wildcards_text", "Jordan smith")
+    repo.set_meta("round_plan_json", "{}")
+    repo.set_meta("round_status_json", "{}")
+    repo.set_alias("Jorge", "Jorge Prado")
+    from rmfantasy.models import SubmissionLog
+    repo.add_submission_log(SubmissionLog(
+        id=None, account_label="a", account_email="a@x.com", lineup_name="L",
+        core_five="1,2,3,4,5", wildcard="W", round_number=1, round_label="R",
+        success=True, message="ok"))
+
+    repo.reset_round()
+
+    # Round data + history cleared...
+    assert repo.get_meta("round_lineups_text") is None
+    assert repo.get_meta("round_wildcards_text") is None
+    assert repo.get_meta("round_plan_json") is None
+    assert repo.get_meta("round_status_json") is None
+    assert repo.list_submission_logs() == []
+    # ...but accounts and name overrides are preserved.
+    assert repo.count_accounts() == 2
+    assert repo.get_aliases() == {"jorge": "Jorge Prado"}
+
+
 def test_name_aliases(repo):
     # Stored normalized (casefold + whitespace-collapsed), upsert on conflict.
     repo.set_alias("  Jorge  ", "Jorge Prado")
