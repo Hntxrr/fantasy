@@ -551,7 +551,7 @@ class App(ctk.CTk):
         ctk.CTkCheckBox(opts, text="Headless", variable=self.su_headless_var
                         ).grid(row=0, column=9, padx=12, sticky="e")
 
-        ctk.CTkLabel(opts, text="Proxies (one host:port per line, optional; round-robin):"
+        ctk.CTkLabel(opts, text="Proxies (one per line: host:port OR host:port:user:pass; round-robin):"
                      ).grid(row=1, column=0, columnspan=8, sticky="w", padx=8, pady=(4, 0))
         self.su_proxy_box = ctk.CTkTextbox(opts, height=44, fg_color=SURFACE_2)
         self.su_proxy_box.grid(row=2, column=0, columnspan=8, sticky="ew", padx=8, pady=(0, 8))

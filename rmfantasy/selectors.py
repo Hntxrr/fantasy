@@ -95,7 +95,8 @@ SIGNUP_FATAL_ERROR_CONTAINS = [
     "already", "exists", "taken", "in use", "registered", "invalid email",
     "must be at least", "too short", "too weak",
 ]
-# Text that (defensively) signals a successful registration.
+# Text that (defensively) signals a successful registration -- also used to
+# recognise the post-signup popup (e.g. the "RM Cash" welcome).
 SIGNUP_SUCCESS_TEXT_CONTAINS = [
     "welcome",
     "account created",
@@ -104,7 +105,28 @@ SIGNUP_SUCCESS_TEXT_CONTAINS = [
     "thanks for signing up",
     "verify your email",
     "confirmation email",
+    "rm cash",
+    "cash balance",
+    "congratulations",
+    "you're all set",
+    "youre all set",
 ]
+
+# The little popup that appears AFTER a successful signup (RM Cash welcome,
+# closed with an X). We treat its presence as proof the account was created,
+# then close it. Containers are matched broadly; a match must ALSO contain one
+# of SIGNUP_SUCCESS_TEXT_CONTAINS to avoid mistaking the signup modal for it.
+SIGNUP_SUCCESS_POPUP_CSS = [
+    ".modal.show", ".modal.in", "[role='dialog']", ".fancybox-container",
+    ".popup", ".reveal.open", ".rmCash", ".welcome-modal", ".swal2-popup",
+]
+# Close controls for that popup (tried in order).
+SIGNUP_POPUP_CLOSE_CSS = [
+    ".fancybox-close", ".fancybox-close-small", ".modal.show .close",
+    ".modal.in .close", "[role='dialog'] .close", ".popup .close",
+    ".swal2-close", "button.close", ".close-button", ".close-x", ".modal-close",
+]
+SIGNUP_POPUP_CLOSE_TEXTS = ["\u00d7", "x", "close", "no thanks", "got it", "continue"]
 
 # --- Rider dropdown heuristics ---------------------------------------------
 # A <select> is treated as a rider dropdown if it has at least this many options.

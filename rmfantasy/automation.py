@@ -19,8 +19,12 @@ Nothing here touches the database; orchestration lives in ``runner.py``.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import tempfile
 import time
+import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
@@ -91,6 +95,75 @@ def _norm(text: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Proxy parsing + authenticated-proxy support
+# --------------------------------------------------------------------------- #
+def parse_proxy(raw: Optional[str]) -> Optional[dict]:
+    """Parse a proxy string into parts.
+
+    Accepts ``host:port`` (open) or ``host:port:user:pass`` (authenticated).
+    The password may itself contain ':' (everything after the 3rd ':' is the
+    password). Returns ``None`` for blank/malformed input.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    parts = raw.split(":")
+    if len(parts) == 2:
+        return {"host": parts[0].strip(), "port": parts[1].strip(), "user": None, "pass": None}
+    if len(parts) >= 4:
+        return {
+            "host": parts[0].strip(),
+            "port": parts[1].strip(),
+            "user": parts[2].strip(),
+            "pass": ":".join(parts[3:]).strip(),
+        }
+    return None
+
+
+def _make_proxy_auth_extension(host: str, port: str, user: str, password: str) -> str:
+    """Write a tiny Chrome extension that applies an authenticated proxy.
+
+    Plain ``--proxy-server`` can't carry credentials, so we generate a small
+    extension that sets the proxy and answers the auth challenge. Returns the
+    path to a packed ``.zip`` suitable for ``options.add_extension``.
+    """
+    manifest = {
+        "version": "1.0.0",
+        "manifest_version": 2,
+        "name": "RM Proxy Auth",
+        "permissions": [
+            "proxy", "tabs", "unlimitedStorage", "storage",
+            "<all_urls>", "webRequest", "webRequestBlocking",
+        ],
+        "background": {"scripts": ["background.js"]},
+        "minimum_chrome_version": "22.0.0",
+    }
+    background = """
+var config = {
+  mode: "fixed_servers",
+  rules: {
+    singleProxy: { scheme: "http", host: "%(host)s", port: parseInt("%(port)s") },
+    bypassList: ["localhost"]
+  }
+};
+chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
+function callbackFn(details) {
+  return { authCredentials: { username: "%(user)s", password: "%(pass)s" } };
+}
+chrome.webRequest.onAuthRequired.addListener(
+  callbackFn, { urls: ["<all_urls>"] }, ['blocking']
+);
+""" % {"host": host, "port": port, "user": user, "pass": password}
+
+    tmp_dir = tempfile.mkdtemp(prefix="rm_proxy_auth_")
+    zip_path = os.path.join(tmp_dir, "proxy_auth.zip")
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("manifest.json", json.dumps(manifest))
+        zf.writestr("background.js", background)
+    return zip_path
+
+
+# --------------------------------------------------------------------------- #
 # Driver lifecycle
 # --------------------------------------------------------------------------- #
 def build_driver(
@@ -101,7 +174,8 @@ def build_driver(
     """Create a Chrome driver bound to an isolated profile directory.
 
     ChromeDriver is resolved via webdriver-manager when available, otherwise
-    Selenium 4's built-in Selenium Manager.
+    Selenium 4's built-in Selenium Manager. ``proxy`` may be ``host:port`` or
+    ``host:port:user:pass`` (authenticated proxies use a generated extension).
     """
     opts = Options()
     opts.add_argument(f"--user-data-dir={profile_dir}")
@@ -111,8 +185,25 @@ def build_driver(
     opts.add_argument("--window-size=1200,860")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
-    if proxy:
-        opts.add_argument(f"--proxy-server={proxy}")
+
+    proxy_info = parse_proxy(proxy)
+    if proxy_info:
+        if proxy_info["user"]:
+            # Authenticated proxy -> credentials via a generated extension.
+            try:
+                ext = _make_proxy_auth_extension(
+                    proxy_info["host"], proxy_info["port"],
+                    proxy_info["user"], proxy_info["pass"],
+                )
+                opts.add_extension(ext)
+                if headless:
+                    log.warning("Authenticated proxy + headless can be unreliable; "
+                                "run sign-ups with Headless OFF if the proxy fails.")
+            except Exception:  # noqa: BLE001
+                log.exception("Failed to build proxy-auth extension; continuing without proxy")
+        else:
+            opts.add_argument(f"--proxy-server={proxy_info['host']}:{proxy_info['port']}")
+
     if headless:
         opts.add_argument("--headless=new")
 
@@ -752,30 +843,72 @@ def _open_signup_modal(driver, timeout: int = 30) -> bool:
     return _signup_form_present(driver)
 
 
-def _confirm_signup(driver, timeout: int = 30) -> bool:
-    """Success == logged in, OR a success message, OR the form disappeared."""
-    success_texts = [t.casefold() for t in selectors.SIGNUP_SUCCESS_TEXT_CONTAINS]
+def _find_success_popup(driver):
+    """The post-signup success popup (e.g. the 'RM Cash' welcome), if visible.
 
-    def _has_success(d) -> bool:
-        try:
-            body = d.find_element(By.TAG_NAME, "body").text.casefold()
-        except Exception:  # noqa: BLE001
-            return False
-        return any(t in body for t in success_texts)
+    Must be a visible popup-ish container that is NOT the signup form (no
+    password field inside) AND contains a success keyword -- so we don't
+    mistake the signup modal or static page text for it.
+    """
+    keys = [t.casefold() for t in selectors.SIGNUP_SUCCESS_TEXT_CONTAINS]
+    for css in selectors.SIGNUP_SUCCESS_POPUP_CSS:
+        for el in driver.find_elements(By.CSS_SELECTOR, css):
+            try:
+                if not el.is_displayed():
+                    continue
+                if el.find_elements(By.CSS_SELECTOR, "input[type='password']"):
+                    continue
+                txt = (el.text or "").casefold()
+                if txt and any(k in txt for k in keys):
+                    return el
+            except StaleElementReferenceException:
+                continue
+    return None
 
+
+def _dismiss_success_popup(driver, popup) -> None:
+    """Close the success popup via its X / close control (best effort)."""
+    close_texts = [t.casefold() for t in selectors.SIGNUP_POPUP_CLOSE_TEXTS]
     try:
-        wait_until_any(
-            driver,
-            [
-                lambda d: is_logged_in(d),
-                _has_success,
-                lambda d: not _signup_form_present(d),
-            ],
-            timeout=timeout,
-        )
+        for el in popup.find_elements(By.CSS_SELECTOR, "button, a, span, i, div"):
+            try:
+                if el.is_displayed() and " ".join((el.text or "").split()).casefold() in close_texts:
+                    _click(driver, el)
+                    return
+            except StaleElementReferenceException:
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    for css in selectors.SIGNUP_POPUP_CLOSE_CSS:
+        el = _find_first_visible(driver, [css])
+        if el is not None:
+            _click(driver, el)
+            return
+
+
+def _confirm_signup(driver, timeout: int = 30, status_cb: Optional[StatusCallback] = None) -> bool:
+    """Strictly confirm a REAL signup before we keep the account.
+
+    Success == the post-signup popup (e.g. RM Cash) appears, OR the site logs
+    you in (rider dropdowns become editable). The weak "the form disappeared"
+    signal is intentionally NOT used, so accounts that were never actually
+    created don't get saved.
+    """
+    say = status_cb or (lambda _m: None)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        popup = _find_success_popup(driver)
+        if popup is not None:
+            say("Success popup detected (RM Cash) - closing it.")
+            _dismiss_success_popup(driver, popup)
+            return True
+        if is_logged_in(driver):
+            return True
+        time.sleep(0.5)
+    # Final check after the wait window.
+    if _find_success_popup(driver) is not None or is_logged_in(driver):
         return True
-    except TimeoutException:
-        return False
+    return False
 
 
 def _scroll_and_click(driver, el) -> None:
@@ -937,7 +1070,8 @@ def do_signup(
     # times manually). Before each retry we re-tick the 18+ radio (in case the
     # re-render cleared it) and re-click a fresh submit button. We stop early on
     # a real rejection (duplicate email, weak password, etc.) or once confirmed.
-    say("Submitting registration...")
+    attempts = max(1, submit_attempts)
+    say(f"Submitting registration (try 1/{attempts})...")
     if not _click_signup_submit(driver):
         raise SignupError(
             "Could not find the registration Submit button. Check "
@@ -946,14 +1080,14 @@ def do_signup(
 
     confirmed = False
     last_error = ""
-    attempts = max(1, submit_attempts)
     for attempt in range(1, attempts + 1):
-        # Per-attempt wait for a success signal (modal closes / logged in /
-        # success text).
-        if _confirm_signup(driver, timeout=submit_retry_delay + 3):
+        # Wait for a STRICT success signal (RM Cash popup / logged in).
+        say(f"Waiting for confirmation (try {attempt}/{attempts})...")
+        if _confirm_signup(driver, timeout=submit_retry_delay + 4, status_cb=say):
             confirmed = True
+            say("Confirmed - account created on site.")
             break
-        # Inspect any inline error; bail out if it's clearly not retryable.
+        # Inspect any inline error; bail out only on a clearly fatal one.
         err = _find_first_visible(driver, [selectors.SIGNUP_ERROR_CSS])
         etext = " ".join(err.text.split()) if err and (err.text or "").strip() else ""
         if etext:
@@ -961,19 +1095,22 @@ def do_signup(
             if _is_fatal_signup_error(etext):
                 raise SignupError(f"Registration rejected: {etext[:200]}")
         if attempt < attempts:
-            say(f"Verification failed? Re-submitting (try {attempt + 1}/{attempts})...")
-            # Re-assert 18+ then re-click a fresh submit button.
+            reason = f" (site said: {etext[:60]})" if etext else " (no confirmation yet)"
+            say(f"Not confirmed{reason} - re-clicking Submit (try {attempt + 1}/{attempts})...")
+            # Re-assert 18+ (the re-render may clear it), then re-click Submit.
             _check_age_radio(driver, selectors.SIGNUP_AGE_OK_LABEL_CONTAINS)
             time.sleep(submit_retry_delay)
-            _click_signup_submit(driver)
-
-    # Keep the browser open a moment so the account-creation request finishes.
-    if post_submit_dwell > 0:
-        time.sleep(post_submit_dwell)
+            if not _click_signup_submit(driver):
+                say("Warning: could not find the Submit button to re-click.")
 
     if not confirmed:
         detail = f" Site said: {last_error[:200]}" if last_error else ""
         raise SignupError(
-            f"Registration not confirmed after {attempts} submit attempts.{detail} "
-            f"Try increasing 'Submit attempts', or the site may be rate-limiting."
+            f"Registration NOT confirmed after {attempts} submit attempts.{detail} "
+            f"No account saved. Increase 'Submit attempts' or check the site."
         )
+
+    # Confirmed -- keep the browser open a moment so everything finalizes.
+    if post_submit_dwell > 0:
+        say(f"Done - holding browser open {post_submit_dwell:g}s...")
+        time.sleep(post_submit_dwell)
