@@ -778,12 +778,64 @@ def _confirm_signup(driver, timeout: int = 30) -> bool:
         return False
 
 
-def _click_submit(driver) -> bool:
-    submit = _find_first_visible(driver, [selectors.SIGNUP_SUBMIT_CSS])
-    if submit is not None:
-        _click(driver, submit)
+def _scroll_and_click(driver, el) -> None:
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+    except Exception:  # noqa: BLE001
+        pass
+    _click(driver, el)
+
+
+def _click_signup_submit(driver) -> bool:
+    """Click the registration Submit button, tolerating styled / re-rendered
+    buttons (mirrors the tolerant 'open sign-up' logic).
+
+    Returns True if a submit-like control was clicked. Searches the signup
+    modal scope first, then the whole page; matches by CSS, then by text
+    *containing* 'submit' (or the configured texts), shortest label first.
+    """
+    el = _find_first_visible(driver, [selectors.SIGNUP_SUBMIT_CSS])
+    if el is not None:
+        _scroll_and_click(driver, el)
         return True
-    return _click_by_text(driver, selectors.SIGNUP_SUBMIT_TEXTS)
+
+    subs = [s.casefold() for s in selectors.SIGNUP_SUBMIT_TEXTS] + ["submit"]
+    exclude = ("log in", "login", "sign in", "cancel", "close", "reset", "back")
+    scope = _signup_scope(driver)
+    roots = [scope] if scope is not driver else [driver]
+    if scope is not driver:
+        roots.append(driver)  # fall back to whole page if scoped search misses
+    for root in roots:
+        cands: list[tuple[int, object]] = []
+        seen: set[tuple[str, str]] = set()
+        for tag in ("button", "input", "a", "span", "div"):
+            for e in root.find_elements(By.TAG_NAME, tag):
+                try:
+                    if not e.is_displayed():
+                        continue
+                    raw = e.get_attribute("value") if tag == "input" else e.text
+                    t = " ".join((raw or "").split())
+                    low = t.casefold()
+                    if not low or len(low) > 30:
+                        continue
+                    if any(x in low for x in exclude):
+                        continue
+                    if any(s in low for s in subs):
+                        key = (tag, t)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        cands.append((len(low), e))
+                except StaleElementReferenceException:
+                    continue
+        cands.sort(key=lambda pair: pair[0])
+        for _, e in cands:
+            try:
+                _scroll_and_click(driver, e)
+                return True
+            except Exception:  # noqa: BLE001
+                continue
+    return False
 
 
 def _is_fatal_signup_error(text: str) -> bool:
@@ -797,8 +849,9 @@ def do_signup(
     status_cb: Optional[StatusCallback] = None,
     timeout: int = 30,
     post_submit_dwell: float = 4.0,
-    submit_attempts: int = 6,
-    submit_retry_delay: float = 2.5,
+    submit_attempts: int = 8,
+    submit_retry_delay: float = 3.0,
+    pre_submit_delay: float = 3.0,
 ) -> None:
     """Register a brand-new account from a :class:`SignupProfile`.
 
@@ -872,13 +925,20 @@ def do_signup(
     if not _check_age_radio(driver, selectors.SIGNUP_AGE_OK_LABEL_CONTAINS):
         say("Warning: could not find the '18 or older' option - check SIGNUP_AGE_OK_LABEL_CONTAINS.")
 
-    # Submit -- and RETRY the click several times. The site's AJAX
-    # registration is flaky and often reports "verification failed" on the
-    # first press, then goes through on a later one (this mirrors having to
-    # re-click Submit a few times manually). We stop early on a real rejection
-    # (duplicate email, weak password, etc.) or once it's confirmed.
+    # A short human-like pause BEFORE submitting. The form is filled very fast,
+    # and submitting instantly is what trips the site's "verification failed".
+    # (This does not slow the fill -- just adds a beat before the first click.)
+    if pre_submit_delay > 0:
+        time.sleep(pre_submit_delay)
+
+    # Submit -- and RETRY the click several times. The site's registration is
+    # flaky and often reports "verification failed" on the first press, then
+    # goes through on a later one (this mirrors having to re-click Submit a few
+    # times manually). Before each retry we re-tick the 18+ radio (in case the
+    # re-render cleared it) and re-click a fresh submit button. We stop early on
+    # a real rejection (duplicate email, weak password, etc.) or once confirmed.
     say("Submitting registration...")
-    if not _click_submit(driver):
+    if not _click_signup_submit(driver):
         raise SignupError(
             "Could not find the registration Submit button. Check "
             "SIGNUP_SUBMIT_TEXTS / SIGNUP_SUBMIT_CSS in selectors.py."
@@ -888,9 +948,9 @@ def do_signup(
     last_error = ""
     attempts = max(1, submit_attempts)
     for attempt in range(1, attempts + 1):
-        # Short per-attempt wait for a success signal (modal closes / logged
-        # in / success text).
-        if _confirm_signup(driver, timeout=6):
+        # Per-attempt wait for a success signal (modal closes / logged in /
+        # success text).
+        if _confirm_signup(driver, timeout=submit_retry_delay + 3):
             confirmed = True
             break
         # Inspect any inline error; bail out if it's clearly not retryable.
@@ -901,9 +961,11 @@ def do_signup(
             if _is_fatal_signup_error(etext):
                 raise SignupError(f"Registration rejected: {etext[:200]}")
         if attempt < attempts:
-            say(f"Not confirmed yet - re-submitting (try {attempt + 1}/{attempts})...")
+            say(f"Verification failed? Re-submitting (try {attempt + 1}/{attempts})...")
+            # Re-assert 18+ then re-click a fresh submit button.
+            _check_age_radio(driver, selectors.SIGNUP_AGE_OK_LABEL_CONTAINS)
             time.sleep(submit_retry_delay)
-            _click_submit(driver)
+            _click_signup_submit(driver)
 
     # Keep the browser open a moment so the account-creation request finishes.
     if post_submit_dwell > 0:

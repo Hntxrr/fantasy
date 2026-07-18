@@ -544,7 +544,7 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(opts, text="Submit attempts:").grid(row=0, column=7, padx=(8, 4))
         self.su_attempts_entry = ctk.CTkEntry(opts, width=48)
-        self.su_attempts_entry.insert(0, "6")
+        self.su_attempts_entry.insert(0, "8")
         self.su_attempts_entry.grid(row=0, column=8, padx=4)
 
         self.su_headless_var = ctk.BooleanVar(value=False)
@@ -664,9 +664,9 @@ class App(ctk.CTk):
         except ValueError:
             keep_open = 5.0
         try:
-            attempts = int(self.su_attempts_entry.get() or "6")
+            attempts = int(self.su_attempts_entry.get() or "8")
         except ValueError:
-            attempts = 6
+            attempts = 8
         proxies = [ln.strip() for ln in self.su_proxy_box.get("1.0", "end").splitlines() if ln.strip()]
 
         self.signup_runner = SignupRunner(

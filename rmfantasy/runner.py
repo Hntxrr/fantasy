@@ -289,7 +289,7 @@ class SignupRunner:
         proxies: Optional[list[str]] = None,
         signup_timeout: int = 45,
         post_submit_dwell: float = 4.0,
-        submit_attempts: int = 6,
+        submit_attempts: int = 8,
     ) -> None:
         self.city = city
         self.state = state
