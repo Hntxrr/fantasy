@@ -506,17 +506,22 @@ class App(ctk.CTk):
             f"into by hand. Continue?",
         ):
             return
-        accts = {a.id: a for a in self.repo.list_accounts()}
-        targets = [(accts[i].label, accts[i].profile_dir) for i in ids if i in accts]
+        # Gather credentials on the main thread (DB access), then hand off.
+        targets = []
+        for i in ids:
+            acc = self.repo.get_account(i, include_password=True)
+            if acc is not None:
+                targets.append((acc.email, acc.password, acc.profile_dir))
         self.accounts_status.configure(
             text=f"Opening {len(targets)} Chrome window(s) - log in, then click 'Refresh login status'."
         )
         threading.Thread(target=self._open_chrome_worker, args=(targets,), daemon=True).start()
 
     def _open_chrome_worker(self, targets) -> None:
-        for _label, profile_dir in targets:
+        for email, password, profile_dir in targets:
             try:
-                automation.open_profile_browser(profile_dir)
+                landing = automation.build_login_landing(email, password)
+                automation.open_profile_browser(profile_dir, landing)
             except Exception as exc:  # noqa: BLE001
                 self.events.put(("si_error", str(exc)))
                 return

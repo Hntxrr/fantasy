@@ -19,13 +19,16 @@ Nothing here touches the database; orchestration lives in ``runner.py``.
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
@@ -290,6 +293,45 @@ def find_chrome_path() -> Optional[str]:
     return None
 
 
+def build_login_landing(email: str, password: str, site_url: Optional[str] = None) -> str:
+    """Write a local HTML page that shows one account's email+password.
+
+    Opened as the first page in that account's Chrome window so the window
+    self-identifies (title = email) and hands you the credentials to paste into
+    the login (which opens in a new tab). Returns the file path.
+    """
+    site = site_url or config.BASE_URL
+    e_attr, p_attr = html.escape(email), html.escape(password)
+    e_js, p_js = json.dumps(email), json.dumps(password)
+    doc = f"""<!doctype html><html><head><meta charset="utf-8"><title>{e_attr}</title>
+<style>
+ body{{background:#0b0d12;color:#f2f4f8;font-family:Segoe UI,Arial,sans-serif;padding:36px}}
+ .card{{max-width:540px;margin:0 auto;background:#14161f;border:2px solid #2f6bff;border-radius:14px;padding:24px}}
+ h1{{font-size:20px;margin:0 0 4px}} .muted{{color:#9aa3b2;font-size:13px;margin-bottom:16px}}
+ label{{font-size:12px;color:#9aa3b2;display:block;margin-top:14px}}
+ .row{{display:flex;gap:8px;margin-top:4px}}
+ input{{flex:1;background:#0b0d12;color:#fff;border:1px solid #262a36;border-radius:8px;padding:10px;font-size:15px}}
+ button{{background:#2f6bff;color:#fff;border:0;border-radius:8px;padding:0 14px;cursor:pointer;font-weight:700}}
+ .go{{display:inline-block;margin-top:22px;background:#22c55e;color:#fff;padding:12px 18px;border-radius:10px;text-decoration:none;font-weight:700}}
+</style></head><body><div class="card">
+ <h1>Log in this account</h1>
+ <div class="muted">This window is for ONE account. Copy the email + password, open the
+  login (button below), paste them and clear the captcha. Then close this window.</div>
+ <label>Email</label>
+ <div class="row"><input id="em" value="{e_attr}" readonly onclick="this.select()">
+  <button onclick="cp({e_js},this)">Copy</button></div>
+ <label>Password</label>
+ <div class="row"><input id="pw" value="{p_attr}" readonly onclick="this.select()">
+  <button onclick="cp({p_js},this)">Copy</button></div>
+ <a class="go" href="{html.escape(site)}" target="_blank" rel="noopener">Open RMFantasy login &#8594;</a>
+ <script>function cp(v,b){{try{{navigator.clipboard.writeText(v);b.textContent='Copied';}}catch(e){{}}}}</script>
+</div></body></html>"""
+    fd, path = tempfile.mkstemp(prefix="rm_login_", suffix=".html")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(doc)
+    return path
+
+
 def open_profile_browser(profile_dir: str, url: Optional[str] = None) -> None:
     """Launch a NORMAL Chrome window on ``profile_dir`` (no Selenium/automation).
 
@@ -303,13 +345,17 @@ def open_profile_browser(profile_dir: str, url: Optional[str] = None) -> None:
             "Could not find Chrome. Install Google Chrome (or tell me the path "
             "to chrome.exe)."
         )
+    target = url or config.BASE_URL
+    # Local files must be passed as file:// URLs.
+    if os.path.exists(target):
+        target = Path(target).as_uri()
     args = [
         exe,
         f"--user-data-dir={profile_dir}",
         "--no-first-run",
         "--no-default-browser-check",
         "--new-window",
-        url or config.BASE_URL,
+        target,
     ]
     subprocess.Popen(args)
 
