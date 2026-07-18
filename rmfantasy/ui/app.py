@@ -525,7 +525,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(opts, text="Concurrent browsers:").grid(row=0, column=0, padx=(8, 4), pady=8)
         self.su_conc_value = ctk.CTkLabel(opts, text="1", width=28)
         self.su_conc_slider = ctk.CTkSlider(
-            opts, from_=1, to=8, number_of_steps=7, width=120,
+            opts, from_=1, to=10, number_of_steps=9, width=140,
             command=lambda v: self.su_conc_value.configure(text=str(int(v))),
         )
         self.su_conc_slider.set(1)
