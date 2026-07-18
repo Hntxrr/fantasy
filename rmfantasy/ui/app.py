@@ -174,6 +174,119 @@ class SearchableComboBox(ctk.CTkComboBox):
             pass
 
 
+class ScrollablePicker(ctk.CTkFrame):
+    """A searchable, MOUSE-WHEEL scrollable dropdown for long lists.
+
+    Unlike CTkComboBox (whose dropdown is a native menu you can only nudge with
+    tiny arrows), this opens a popup with a search box and a scrollable list you
+    can spin with the wheel. Same get/set/set_values API as SearchableComboBox.
+    """
+
+    def __init__(self, master, values=None, width=420, placeholder="", **kwargs):
+        super().__init__(master, fg_color="transparent")
+        self._all_values: list[str] = list(values or [])
+        self._popup: tk.Toplevel | None = None
+        self._entry = ctk.CTkEntry(
+            self, placeholder_text=placeholder, fg_color=SURFACE, border_color=BORDER,
+            width=max(80, width - 40),
+        )
+        self._entry.pack(side="left", fill="x", expand=True)
+        self._btn = ctk.CTkButton(
+            self, text="\u25be", width=32, fg_color=BRAND, hover_color=BRAND_HOVER,
+            command=self._open,
+        )
+        self._btn.pack(side="left", padx=(4, 0))
+        self._entry.bind("<Button-1>", lambda e: self._open())
+
+    # Public API (matches SearchableComboBox usage) ------------------- #
+    def set_values(self, values) -> None:
+        self._all_values = list(values)
+
+    def all_values(self) -> list[str]:
+        return list(self._all_values)
+
+    def get(self) -> str:
+        return self._entry.get()
+
+    def set(self, value) -> None:
+        self._entry.delete(0, "end")
+        self._entry.insert(0, value)
+
+    # Popup ----------------------------------------------------------- #
+    def _open(self) -> None:
+        self._close()
+        try:
+            x = self._entry.winfo_rootx()
+            y = self._entry.winfo_rooty() + self._entry.winfo_height() + 2
+            w = max(self.winfo_width(), 340)
+        except Exception:  # noqa: BLE001
+            return
+        pop = tk.Toplevel(self)
+        pop.wm_overrideredirect(True)
+        pop.configure(bg=BORDER)
+        pop.geometry(f"{w}x340+{x}+{y}")
+        self._popup = pop
+
+        search = ctk.CTkEntry(pop, placeholder_text="type to filter...",
+                              fg_color=SURFACE, border_color=BORDER)
+        search.pack(fill="x", padx=4, pady=4)
+        listframe = ctk.CTkScrollableFrame(pop, fg_color=SURFACE)
+        listframe.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+
+        def render(term: str = "") -> None:
+            for child in listframe.winfo_children():
+                child.destroy()
+            t = term.strip().casefold()
+            matches = [v for v in self._all_values if not t or t in v.casefold()]
+            for v in matches[:250]:
+                ctk.CTkButton(
+                    listframe, text=v, anchor="w", height=26, fg_color="transparent",
+                    hover_color=HOVER, text_color=FG,
+                    command=lambda val=v: self._choose(val),
+                ).pack(fill="x", padx=2, pady=1)
+            if len(matches) > 250:
+                ctk.CTkLabel(listframe, text=f"...{len(matches) - 250} more - keep typing",
+                             text_color=FG_MUTED).pack(pady=4)
+            if not matches:
+                ctk.CTkLabel(listframe, text="No matches", text_color=FG_MUTED).pack(pady=6)
+
+        render("")
+        search.bind("<KeyRelease>", lambda e: render(search.get()))
+        pop.bind("<Escape>", lambda e: self._close())
+        # Close when clicking outside the popup.
+        try:
+            pop.grab_set()
+            pop.bind("<Button-1>", self._popup_click)
+        except Exception:  # noqa: BLE001
+            pass
+        search.focus_set()
+
+    def _popup_click(self, event) -> None:
+        pop = self._popup
+        if pop is None:
+            return
+        px, py = pop.winfo_rootx(), pop.winfo_rooty()
+        pw, ph = pop.winfo_width(), pop.winfo_height()
+        if not (px <= event.x_root <= px + pw and py <= event.y_root <= py + ph):
+            self._close()
+
+    def _choose(self, value: str) -> None:
+        self.set(value)
+        self._close()
+
+    def _close(self) -> None:
+        if self._popup is not None:
+            try:
+                self._popup.grab_release()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._popup.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+            self._popup = None
+
+
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
@@ -1066,13 +1179,10 @@ class App(ctk.CTk):
             start_card, text="Start at account:",
             font=ctk.CTkFont(size=13, weight="bold"), text_color=FG,
         ).grid(row=0, column=0, padx=(14, 8), pady=10, sticky="w")
-        self.start_at_combo = SearchableComboBox(
-            start_card, values=[], width=420,
-            fg_color=SURFACE, button_color=BRAND, button_hover_color=BRAND_HOVER,
-            border_color=BORDER, dropdown_fg_color=SURFACE,
-            dropdown_hover_color=HOVER, dropdown_text_color=FG,
+        self.start_at_combo = ScrollablePicker(
+            start_card, values=[], width=440, placeholder="click / type to pick a start account",
         )
-        self.start_at_combo.grid(row=0, column=1, padx=4, pady=10, sticky="w")
+        self.start_at_combo.grid(row=0, column=1, padx=4, pady=10, sticky="ew")
         ctk.CTkButton(
             start_card, text="First account", width=110, fg_color=NEUTRAL,
             hover_color=NEUTRAL_HOV, command=self.on_start_at_first,
