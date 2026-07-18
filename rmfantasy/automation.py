@@ -1174,11 +1174,22 @@ def _open_and_fill(driver, profile: SignupProfile, say, timeout: int) -> None:
         say("Warning: could not find the '18 or older' option - check SIGNUP_AGE_OK_LABEL_CONTAINS.")
 
 
-def _inject_assist_overlay(driver) -> None:
-    """Inject a small in-page panel with 'Account created' / 'Skip' buttons."""
+def _inject_assist_overlay(
+    driver,
+    title: str = "RapidMoto sign-up",
+    instructions: str = "1) Click <b>Submit</b> and clear the captcha.<br>2) Once the account is created, click below.",
+    ok_label: str = "Account created",
+) -> None:
+    """Inject a small in-page panel with an OK / Skip button.
+
+    The OK button sets ``window.__rmSignupResult='confirmed'`` and Skip sets
+    ``'skipped'``; Python polls that value. Re-injectable after page reloads.
+    """
+    payload = json.dumps({"title": title, "instructions": instructions, "ok": ok_label})
     js = r"""
     (function(){
       if (document.getElementById('__rm_assist')) return;
+      var cfg = %s;
       var d = document.createElement('div');
       d.id = '__rm_assist';
       d.style.cssText = 'position:fixed;top:12px;right:12px;z-index:2147483647;'
@@ -1186,27 +1197,26 @@ def _inject_assist_overlay(driver) -> None:
         + 'border-radius:12px;font-family:Segoe UI,Arial,sans-serif;'
         + 'box-shadow:0 8px 30px rgba(0,0,0,.55);max-width:260px';
       d.innerHTML =
-        '<div style="font-weight:700;margin-bottom:6px">RapidMoto sign-up</div>'
+        '<div style="font-weight:700;margin-bottom:6px">' + cfg.title + '</div>'
         + '<div style="font-size:12px;line-height:1.45;margin-bottom:10px;color:#9aa3b2">'
-        + '1) Click <b>Submit</b> and clear the captcha.<br>'
-        + '2) Once the account is created, click below.</div>'
+        + cfg.instructions + '</div>'
         + '<button id="__rm_ok" style="background:#22c55e;color:#fff;border:0;'
         + 'padding:9px 12px;border-radius:7px;cursor:pointer;font-weight:700;margin-right:6px">'
-        + 'Account created \u2713</button>'
+        + cfg.ok + ' \u2713</button>'
         + '<button id="__rm_skip" style="background:#ef4444;color:#fff;border:0;'
         + 'padding:9px 12px;border-radius:7px;cursor:pointer;font-weight:700">Skip</button>';
       document.body.appendChild(d);
       if (typeof window.__rmSignupResult === 'undefined') window.__rmSignupResult = '';
       document.getElementById('__rm_ok').onclick = function(){
         window.__rmSignupResult = 'confirmed';
-        d.innerHTML = '<div style="font-weight:700">Saving account &amp; closing...</div>';
+        d.innerHTML = '<div style="font-weight:700">Saving &amp; closing...</div>';
       };
       document.getElementById('__rm_skip').onclick = function(){
         window.__rmSignupResult = 'skipped';
         d.innerHTML = '<div style="font-weight:700">Skipped.</div>';
       };
     })();
-    """
+    """ % payload
     try:
         driver.execute_script(js)
     except Exception:  # noqa: BLE001
@@ -1272,6 +1282,134 @@ def assist_signup(
         time.sleep(0.6)
 
     raise SignupError("Timed out waiting for you to confirm the account - not saved.")
+
+
+def assist_login(
+    driver,
+    email: str,
+    password: str,
+    status_cb: Optional[StatusCallback] = None,
+    timeout: int = 30,
+    wait_timeout: int = 600,
+) -> None:
+    """Assisted login: fill email+password, you click Log In + clear the captcha.
+
+    The login Submit is a reCAPTCHA button, so a human completes it. We fill the
+    credentials, scroll to the login button, and show the in-page panel. Success
+    is detected automatically (rider dropdowns become editable) OR when you click
+    'Logged in'. Raises :class:`LoginRequired` on skip/close/timeout. The session
+    persists in the Chrome profile so later pick runs reuse it (no re-login).
+    """
+    say = status_cb or (lambda _m: None)
+
+    driver.get(config.BASE_URL)
+    WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    try:
+        WebDriverWait(driver, 25).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+    except TimeoutException:
+        pass
+    time.sleep(1.0)
+
+    if is_logged_in(driver):
+        say("Already logged in (session reused) - marking valid.")
+        return
+
+    say("Opening login form...")
+    link = _find_first_visible(driver, [selectors.LOGIN_LINK_CSS])
+    if link is not None:
+        _click(driver, link)
+    else:
+        _click_by_text(driver, ["LOG IN", "Log In", "Login", "Sign In"])
+
+    try:
+        WebDriverWait(driver, timeout).until(
+            EC.visibility_of_element_located((By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS))
+        )
+    except TimeoutException as exc:
+        raise LoginRequired(
+            "Login form (email field) did not appear. You can still log in "
+            "manually in the browser window, then click 'Logged in'."
+        ) from exc
+
+    # Fill credentials (fire events so the form validates / enables the button).
+    try:
+        email_el = driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS)
+        pwd_el = driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_PASSWORD_CSS)
+        _fill_element(driver, email_el, email)
+        _fill_element(driver, pwd_el, password)
+        say("Filled email + password.")
+    except Exception:  # noqa: BLE001
+        say("Could not auto-fill - type your login in the browser, then click 'Logged in'.")
+
+    # Scroll to the login button so it's easy to click.
+    btn = _find_first_visible(driver, [selectors.LOGIN_SUBMIT_CSS])
+    if btn is None:
+        for want in [t.casefold() for t in selectors.LOGIN_SUBMIT_TEXTS]:
+            for tag in ("button", "input", "a"):
+                for e in driver.find_elements(By.TAG_NAME, tag):
+                    try:
+                        raw = e.get_attribute("value") if tag == "input" else e.text
+                        if e.is_displayed() and " ".join((raw or "").split()).casefold() == want:
+                            btn = e
+                            break
+                    except StaleElementReferenceException:
+                        continue
+                if btn:
+                    break
+            if btn:
+                break
+    if btn is not None:
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+        except Exception:  # noqa: BLE001
+            pass
+
+    _inject_assist_overlay(
+        driver,
+        title="RapidMoto login",
+        instructions=("1) Click <b>Log In</b> and clear the captcha.<br>"
+                      "2) I detect it automatically, or click below."),
+        ok_label="Logged in",
+    )
+    say("Click Log In in the browser & clear the captcha; I'll detect when you're in.")
+
+    deadline = time.time() + wait_timeout
+    while time.time() < deadline:
+        try:
+            if not driver.window_handles:
+                raise LoginRequired("Browser was closed before login completed.")
+        except LoginRequired:
+            raise
+        except Exception:  # noqa: BLE001
+            raise LoginRequired("Browser was closed before login completed.")
+
+        if is_logged_in(driver):
+            say("Logged in - saving session.")
+            return
+        try:
+            result = driver.execute_script("return window.__rmSignupResult || '';")
+        except Exception:  # noqa: BLE001
+            result = ""
+        if result == "confirmed":
+            say("You confirmed login - saving session.")
+            return
+        if result == "skipped":
+            raise LoginRequired("Skipped by you.")
+        try:
+            if not driver.execute_script("return !!document.getElementById('__rm_assist');"):
+                _inject_assist_overlay(
+                    driver, title="RapidMoto login",
+                    instructions=("1) Click <b>Log In</b> and clear the captcha.<br>"
+                                  "2) I detect it automatically, or click below."),
+                    ok_label="Logged in",
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(0.6)
+
+    raise LoginRequired("Timed out waiting for login.")
 
 
 def do_signup(

@@ -163,6 +163,17 @@ _idn = generate_identity()
 print("identity generated (expect True):",
       all([_idn.first_name, _idn.last_name, _idn.phone, _idn.nickname, len(_idn.password) >= 10]))
 
+# --- Assisted sign-in (mocked browser) marks the account session-valid ---
+_runnermod.automation.assist_login = (
+    lambda driver, email, password, status_cb=None, timeout=30, wait_timeout=600:
+    status_cb("mock: logged in") if status_cb else None
+)
+_target = app2.repo.list_accounts()[-1]           # a not-signed-in one (bottom)
+app2.repo.set_session_valid(_target.id, False)
+_runnermod.SigninRunner([_target.id], concurrency=1, launch_stagger=0).run()
+_after = {a.id: a for a in app2.repo.list_accounts()}
+print("assist sign-in marks valid (expect True):", _after[_target.id].session_valid)
+
 app2.update()
 app2.after(50, app2.destroy)
 app2.mainloop()

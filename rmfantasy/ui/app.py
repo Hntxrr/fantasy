@@ -44,6 +44,8 @@ from ..runner import (
     ConcurrentRunner,
     RunCallbacks,
     RunResult,
+    SigninCallbacks,
+    SigninRunner,
     SignupCallbacks,
     SignupRunner,
 )
@@ -195,8 +197,10 @@ class App(ctk.CTk):
         self.run_thread: threading.Thread | None = None
         self.scrape_thread: threading.Thread | None = None
         self.signup_thread: threading.Thread | None = None
+        self.signin_thread: threading.Thread | None = None
         self.runner: ConcurrentRunner | None = None
         self.signup_runner: SignupRunner | None = None
+        self.signin_runner: SigninRunner | None = None
         self._su_row_by_email: dict[str, str] = {}
         self._run_row_by_account: dict[int, str] = {}
         self._run_status: dict[int, tuple] = {}   # account_id -> (status_text, tag)
@@ -386,8 +390,26 @@ class App(ctk.CTk):
         acc_btns.grid(row=2, column=0, sticky="ew", padx=6, pady=6)
         ctk.CTkButton(acc_btns, text="Rename / change password",
                       command=self.on_edit_account).pack(side="left", padx=4)
-        ctk.CTkButton(acc_btns, text="Remove selected", fg_color="#8a2c2c",
-                      hover_color="#a13636", command=self.on_remove_account).pack(side="left", padx=4)
+        ctk.CTkButton(acc_btns, text="Remove selected", fg_color=DANGER,
+                      hover_color=DANGER_HOV, command=self.on_remove_account).pack(side="left", padx=4)
+
+        signin_btns = ctk.CTkFrame(right, fg_color="transparent")
+        signin_btns.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 6))
+        self.signin_selected_btn = ctk.CTkButton(
+            signin_btns, text="Log in selected (assist)", fg_color=BRAND,
+            hover_color=BRAND_HOVER, command=self.on_signin_selected,
+        )
+        self.signin_selected_btn.pack(side="left", padx=4)
+        self.signin_loggedout_btn = ctk.CTkButton(
+            signin_btns, text="Log in ALL not-signed-in", fg_color=NEUTRAL,
+            hover_color=NEUTRAL_HOV, command=self.on_signin_logged_out,
+        )
+        self.signin_loggedout_btn.pack(side="left", padx=4)
+        self.signin_stop_btn = ctk.CTkButton(
+            signin_btns, text="Stop", fg_color=DANGER, hover_color=DANGER_HOV,
+            width=70, state="disabled", command=self.on_signin_stop,
+        )
+        self.signin_stop_btn.pack(side="left", padx=4)
 
     def on_import(self) -> None:
         text = self.import_box.get("1.0", "end")
@@ -454,6 +476,77 @@ class App(ctk.CTk):
             return
         acc = self.repo.get_account(acc_id, include_password=False)
         EditAccountDialog(self, acc_id, acc.label, acc.email)
+
+    # --- Assisted sign-in ------------------------------------------------ #
+    def _selected_account_ids(self) -> list[int]:
+        return [int(iid) for iid in self.accounts_tree.selection() if iid.isdigit()]
+
+    def on_signin_selected(self) -> None:
+        ids = self._selected_account_ids()
+        if not ids:
+            messagebox.showinfo("No selection", "Select one or more accounts in the list first.")
+            return
+        self._start_signin(ids)
+
+    def on_signin_logged_out(self) -> None:
+        ids = [a.id for a in self.repo.list_accounts() if not a.session_valid]
+        if not ids:
+            messagebox.showinfo("Nothing to do", "All accounts are already signed in.")
+            return
+        if not messagebox.askyesno(
+            "Log in not-signed-in accounts",
+            f"Open {len(ids)} browser(s) to log in? You'll click Log In and clear "
+            f"the captcha in each; sign-in is detected automatically.\n\n"
+            f"(Keep concurrency low so you can handle each window.)",
+        ):
+            return
+        self._start_signin(ids)
+
+    def _start_signin(self, ids: list[int]) -> None:
+        if self.signin_thread and self.signin_thread.is_alive():
+            messagebox.showinfo("Busy", "A sign-in run is already in progress.")
+            return
+        # Reuse the Sign Up tab's concurrency/stagger/proxy settings if present.
+        try:
+            conc = int(self.su_conc_slider.get())
+        except Exception:  # noqa: BLE001
+            conc = 2
+        try:
+            stagger = float(self.su_stagger_entry.get() or "3")
+        except Exception:  # noqa: BLE001
+            stagger = 3.0
+        proxies = [ln.strip() for ln in self.su_proxy_box.get("1.0", "end").splitlines() if ln.strip()]
+        self.signin_runner = SigninRunner(
+            ids, concurrency=conc, launch_stagger=stagger, proxies=proxies,
+        )
+        self._set_signin_running(True)
+        self.accounts_status.configure(text=f"Signing in {len(ids)} account(s)... 0/{len(ids)}")
+        self.signin_thread = threading.Thread(target=self._signin_worker, args=(ids,), daemon=True)
+        self.signin_thread.start()
+
+    def _signin_worker(self, ids: list[int]) -> None:
+        cb = SigninCallbacks(
+            on_task_start=lambda aid: self.events.put(("si_status", aid, "Opening browser...")),
+            on_status=lambda aid, m: self.events.put(("si_status", aid, m)),
+            on_result=lambda aid, ok, m: self.events.put(("si_result", aid, ok, m)),
+            on_progress=lambda d, t: self.events.put(("si_progress", d, t)),
+        )
+        try:
+            self.signin_runner.run(cb)
+            self.events.put(("si_done",))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("si_error", str(exc)))
+
+    def on_signin_stop(self) -> None:
+        if self.signin_runner:
+            self.signin_runner.cancel()
+            self.signin_stop_btn.configure(state="disabled", text="Stopping...")
+
+    def _set_signin_running(self, running: bool) -> None:
+        state = "disabled" if running else "normal"
+        self.signin_selected_btn.configure(state=state)
+        self.signin_loggedout_btn.configure(state=state)
+        self.signin_stop_btn.configure(state="normal" if running else "disabled", text="Stop")
 
     # ================================================================== #
     # Sign Up tab
@@ -1685,6 +1778,25 @@ class App(ctk.CTk):
             self.debug_form_btn.configure(state="normal", text="Debug form")
             self.signup_status_lbl.configure(text="Form dump failed.")
             messagebox.showerror("Debug form failed", str(evt[1]))
+        elif kind == "si_status":
+            acc = self.repo.get_account(evt[1], include_password=False)
+            label = acc.label if acc else f"#{evt[1]}"
+            self.accounts_status.configure(text=f"[{label}] {evt[2]}")
+        elif kind == "si_result":
+            acc = self.repo.get_account(evt[1], include_password=False)
+            label = acc.label if acc else f"#{evt[1]}"
+            self.accounts_status.configure(text=f"[{label}] {evt[3]}")
+            self.refresh_accounts()
+        elif kind == "si_progress":
+            self.accounts_status.configure(text=f"Signing in... {evt[1]}/{evt[2]}")
+        elif kind == "si_done":
+            self._set_signin_running(False)
+            self.refresh_accounts()
+            self.accounts_status.configure(text="Sign-in run finished.")
+        elif kind == "si_error":
+            self._set_signin_running(False)
+            self.refresh_accounts()
+            messagebox.showerror("Sign-in error", str(evt[1]))
 
     def _update_run_row(self, account_id: int, status: str, tag: str, remember: bool = True):
         iid = self._run_row_by_account.get(account_id)
@@ -1725,6 +1837,8 @@ class App(ctk.CTk):
                 self.runner.cancel()
             if self.signup_runner:
                 self.signup_runner.cancel()
+            if self.signin_runner:
+                self.signin_runner.cancel()
             # Persist the round so nothing is lost on close (cleared only by Reset round).
             self._persist_round()
             self._persist_plan()

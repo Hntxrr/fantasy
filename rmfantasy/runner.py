@@ -425,3 +425,103 @@ class SignupRunner:
             return SignupResult(email, False, f"Unexpected error: {exc}")
         finally:
             repo.close()
+
+
+
+# --------------------------------------------------------------------------- #
+# Assisted sign-in runner
+# --------------------------------------------------------------------------- #
+@dataclass
+class SigninCallbacks:
+    on_task_start: Callable[[int], None] = _noop           # account_id
+    on_status: Callable[[int, str], None] = _noop          # account_id, message
+    on_result: Callable[[int, bool, str], None] = _noop    # account_id, ok, message
+    on_progress: Callable[[int, int], None] = _noop        # done, total
+    should_cancel: Callable[[], bool] = field(default=lambda: False)
+
+
+class SigninRunner:
+    """Assisted login for existing accounts.
+
+    Opens each account's browser, fills email+password, and lets you click
+    Log In + clear the reCAPTCHA. On success (auto-detected or you confirm) the
+    account is marked session-valid and the session is saved in its profile, so
+    later pick runs reuse it. A visible browser is always used.
+    """
+
+    def __init__(
+        self,
+        account_ids: list[int],
+        *,
+        concurrency: int = 2,
+        launch_stagger: float = 3.0,
+        proxies: Optional[list[str]] = None,
+        wait_timeout: int = 600,
+    ) -> None:
+        self.account_ids = list(account_ids)
+        self.concurrency = max(1, min(15, concurrency))
+        self.launch_stagger = max(0.0, launch_stagger)
+        self.proxies = [p for p in (proxies or []) if p.strip()]
+        self.wait_timeout = max(30, wait_timeout)
+
+        self._cipher = CredentialCipher()
+        self._launch_lock = threading.Lock()
+        self._last_launch = 0.0
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def _stagger(self) -> None:
+        if self.launch_stagger <= 0:
+            return
+        with self._launch_lock:
+            now = time.monotonic()
+            wait = self._last_launch + self.launch_stagger - now
+            if wait > 0:
+                time.sleep(wait)
+            self._last_launch = time.monotonic()
+
+    def run(self, callbacks: Optional[SigninCallbacks] = None) -> None:
+        cb = callbacks or SigninCallbacks()
+        total = len(self.account_ids)
+        done = 0
+        should_cancel = lambda: self._cancel.is_set() or cb.should_cancel()  # noqa: E731
+        with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
+            futures = {
+                pool.submit(self._signin_one, idx, aid, cb, should_cancel): aid
+                for idx, aid in enumerate(self.account_ids)
+            }
+            for future in as_completed(futures):
+                future.result()
+                done += 1
+                cb.on_progress(done, total)
+
+    def _signin_one(self, index, account_id, cb, should_cancel) -> None:
+        status = lambda m: cb.on_status(account_id, m)  # noqa: E731
+        if should_cancel():
+            cb.on_result(account_id, False, "Cancelled.")
+            return
+        cb.on_task_start(account_id)
+        repo = Repository(cipher=self._cipher)
+        try:
+            acc = repo.get_account(account_id, include_password=True)
+            if acc is None:
+                cb.on_result(account_id, False, "Account no longer exists.")
+                return
+            proxy = self.proxies[index % len(self.proxies)] if self.proxies else None
+            self._stagger()
+            if should_cancel():
+                cb.on_result(account_id, False, "Cancelled.")
+                return
+            with automation.chrome_session(acc.profile_dir, headless=False, proxy=proxy) as driver:
+                automation.assist_login(
+                    driver, acc.email, acc.password,
+                    status_cb=status, wait_timeout=self.wait_timeout,
+                )
+            repo.set_session_valid(account_id, True)
+            cb.on_result(account_id, True, "Logged in - session saved.")
+        except Exception as exc:  # noqa: BLE001
+            cb.on_result(account_id, False, str(exc))
+        finally:
+            repo.close()
