@@ -615,12 +615,24 @@ def _find_input_by_placeholder(scope, placeholder_substrings):
     return None
 
 
-def _fill_element(el, value: str) -> None:
+def _fill_element(driver, el, value: str) -> None:
     try:
         el.clear()
     except Exception:  # noqa: BLE001
         pass
     el.send_keys(value)
+    # Fire the events client-side frameworks listen for, so validation runs and
+    # a "disabled until valid" Submit button becomes enabled.
+    try:
+        driver.execute_script(
+            "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
+            "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));"
+            "arguments[0].dispatchEvent(new Event('keyup', {bubbles:true}));"
+            "arguments[0].dispatchEvent(new Event('blur', {bubbles:true}));",
+            el,
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _find_input_by_label(driver, scope, label_substrings):
@@ -694,7 +706,7 @@ def _fill_field(driver, scope, placeholders, labels, value, field_name, required
                 f"SIGNUP_* selectors can be set exactly."
             )
         return False
-    _fill_element(el, value)
+    _fill_element(driver, el, value)
     return True
 
 
@@ -936,7 +948,66 @@ def _scroll_and_click(driver, el) -> None:
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
     except Exception:  # noqa: BLE001
         pass
-    _click(driver, el)
+    # If the control is gated 'disabled' (client-side until valid), un-gate it
+    # so the click can go through.
+    try:
+        driver.execute_script(
+            "arguments[0].removeAttribute('disabled');"
+            "if(arguments[0].classList){arguments[0].classList.remove('disabled');}",
+            el,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        el.click()
+        return
+    except _TRANSIENT:
+        pass
+    try:
+        driver.execute_script("arguments[0].click();", el)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def dump_signup_form(driver) -> str:
+    """Return a detailed dump of the signup form's buttons + fields.
+
+    Used by the 'Debug form' button so the exact Submit-button markup can be
+    shared and the selectors set precisely.
+    """
+    scope = _signup_scope(driver)
+    lines: list[str] = ["=== BUTTONS / CLICKABLES ==="]
+    for tag in ("button", "input", "a"):
+        for el in scope.find_elements(By.TAG_NAME, tag):
+            try:
+                if not el.is_displayed():
+                    continue
+                typ = (el.get_attribute("type") or "").strip()
+                if tag == "input" and typ not in ("submit", "button", "image", ""):
+                    continue
+                txt = " ".join(((el.get_attribute("value") if tag == "input" else el.text) or "").split())
+                oh = " ".join((el.get_attribute("outerHTML") or "").split())[:220]
+                lines.append(
+                    f"<{tag}> type={typ or '-'} enabled={el.is_enabled()} "
+                    f"class={el.get_attribute('class') or ''!r} text={txt!r}"
+                )
+                lines.append(f"    {oh}")
+            except Exception:  # noqa: BLE001
+                continue
+    lines.append("")
+    lines.append("=== INPUT / SELECT FIELDS ===")
+    for el in scope.find_elements(By.CSS_SELECTOR, "input, textarea, select"):
+        try:
+            if not el.is_displayed():
+                continue
+            lines.append(
+                f"<{el.tag_name}> type={el.get_attribute('type') or '-'} "
+                f"ph={el.get_attribute('placeholder') or ''!r} "
+                f"name={el.get_attribute('name') or ''!r} id={el.get_attribute('id') or ''!r}"
+            )
+        except Exception:  # noqa: BLE001
+            continue
+    return "\n".join(lines)
 
 
 def _element_label(el) -> str:
@@ -1008,8 +1079,13 @@ def _click_signup_submit(driver, status_cb: Optional[StatusCallback] = None) -> 
         say("Could not find a Submit button to click.")
         return False
     label = _element_label(el)
+    was_disabled = False
+    try:
+        was_disabled = el.get_attribute("disabled") is not None or not el.is_enabled()
+    except Exception:  # noqa: BLE001
+        pass
     _scroll_and_click(driver, el)
-    say(f"Clicked Submit ('{label or el.tag_name}').")
+    say(f"Clicked Submit ('{label or el.tag_name}'{', was disabled' if was_disabled else ''}).")
     return True
 
 
@@ -1087,13 +1163,13 @@ def do_signup(
     pwd_inputs = [e for e in scope.find_elements(By.CSS_SELECTOR, "input[type='password']") if _is_visible(e)]
     if not pwd_inputs:
         raise SignupError("Could not find the password field on the sign-up form.")
-    _fill_element(pwd_inputs[0], profile.password)
+    _fill_element(driver, pwd_inputs[0], profile.password)
     if len(pwd_inputs) >= 2:
-        _fill_element(pwd_inputs[1], profile.password)
+        _fill_element(driver, pwd_inputs[1], profile.password)
     else:
         confirm = _find_input_by_placeholder(scope, selectors.SIGNUP_CONFIRM_PLACEHOLDERS)
         if confirm is not None:
-            _fill_element(confirm, profile.password)
+            _fill_element(driver, confirm, profile.password)
 
     # "I am 18 years or older" eligibility radio (required to submit).
     say("Confirming 18+...")

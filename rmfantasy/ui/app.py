@@ -583,6 +583,11 @@ class App(ctk.CTk):
             height=40, width=100, command=self.on_test_proxy,
         )
         self.test_proxy_btn.pack(side="left", padx=4)
+        self.debug_form_btn = ctk.CTkButton(
+            actions, text="Debug form", fg_color=NEUTRAL, hover_color=NEUTRAL_HOV,
+            height=40, width=100, command=self.on_debug_form,
+        )
+        self.debug_form_btn.pack(side="left", padx=4)
         self.signup_progress = ctk.CTkProgressBar(actions, width=220)
         self.signup_progress.set(0)
         self.signup_progress.pack(side="left", padx=12)
@@ -739,6 +744,37 @@ class App(ctk.CTk):
             self.events.put(("proxy_ip", ip or "(could not read IP)"))
         except Exception as exc:  # noqa: BLE001
             self.events.put(("proxy_err", str(exc)))
+
+    def on_debug_form(self) -> None:
+        """Open the signup modal and dump its buttons/fields to a file."""
+        proxies = [ln.strip() for ln in self.su_proxy_box.get("1.0", "end").splitlines() if ln.strip()]
+        proxy = proxies[0] if proxies else None
+        self.debug_form_btn.configure(state="disabled", text="Dumping...")
+        self.signup_status_lbl.configure(text="Opening sign-up form to dump its fields...")
+        threading.Thread(target=self._debug_form_worker, args=(proxy,), daemon=True).start()
+
+    def _debug_form_worker(self, proxy) -> None:
+        import tempfile
+        prof = tempfile.mkdtemp(prefix="rm_debugform_")
+        try:
+            driver = automation.build_driver(prof, headless=False, proxy=proxy)
+            try:
+                driver.get(config.BASE_URL)
+                automation._open_signup_modal(driver, timeout=30)
+                time.sleep(1.0)
+                report = automation.dump_signup_form(driver)
+            finally:
+                try:
+                    driver.quit()
+                except Exception:  # noqa: BLE001
+                    pass
+            config.ensure_dirs()
+            path = config.APP_DIR / "signup_form_debug.txt"
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(report)
+            self.events.put(("debug_dump", str(path), report))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("debug_err", str(exc)))
 
     def _set_signup_running(self, running: bool) -> None:
         self.signup_btn.configure(state="disabled" if running else "normal")
@@ -1628,6 +1664,20 @@ class App(ctk.CTk):
                 f"Could not load a page through the proxy:\n\n{evt[1]}\n\n"
                 "Check the host:port:user:pass and that the proxy is active.",
             )
+        elif kind == "debug_dump":
+            self.debug_form_btn.configure(state="normal", text="Debug form")
+            path, report = evt[1], evt[2]
+            self.signup_status_lbl.configure(text=f"Form dump written to: {path}")
+            head = report[:1200] + ("\n... (full dump in the file above)" if len(report) > 1200 else "")
+            messagebox.showinfo(
+                "Sign-up form dump",
+                f"Saved the form's buttons + fields to:\n{path}\n\n"
+                f"Open that file and share it with me.\n\n{head}",
+            )
+        elif kind == "debug_err":
+            self.debug_form_btn.configure(state="normal", text="Debug form")
+            self.signup_status_lbl.configure(text="Form dump failed.")
+            messagebox.showerror("Debug form failed", str(evt[1]))
 
     def _update_run_row(self, account_id: int, status: str, tag: str, remember: bool = True):
         iid = self._run_row_by_account.get(account_id)
