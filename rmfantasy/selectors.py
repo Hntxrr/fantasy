@@ -56,6 +56,20 @@ SIGNUP_NICKNAME_PLACEHOLDERS = ["nickname"]
 SIGNUP_PASSWORD_PLACEHOLDERS = ["password"]
 SIGNUP_CONFIRM_PLACEHOLDERS = ["confirm"]
 
+# <label> text (case-insensitive *contains*) used to locate each field when the
+# placeholder match fails. Wicket forms usually pair a visible <label> with the
+# input, so this is the most reliable locator.
+SIGNUP_FIRST_NAME_LABELS = ["first name"]
+SIGNUP_LAST_NAME_LABELS = ["last name"]
+SIGNUP_EMAIL_LABELS = ["email"]
+SIGNUP_PHONE_LABELS = ["phone"]
+SIGNUP_STREET_LABELS = ["street", "address"]
+SIGNUP_CITY_LABELS = ["city"]
+SIGNUP_POSTAL_LABELS = ["postal", "zip"]
+SIGNUP_NICKNAME_LABELS = ["nickname"]
+SIGNUP_PASSWORD_LABELS = ["password"]
+SIGNUP_CONFIRM_LABELS = ["confirm"]
+
 # <label> text used to locate the Country / State <select> elements.
 SIGNUP_COUNTRY_LABELS = ["country"]
 SIGNUP_STATE_LABELS = ["state"]

@@ -512,11 +512,76 @@ def _fill_element(el, value: str) -> None:
     el.send_keys(value)
 
 
-def _fill_placeholder_field(scope, placeholders, value, field_name, required=True) -> bool:
+def _find_input_by_label(driver, scope, label_substrings):
+    """Find an input/textarea via its associated <label> text.
+
+    Tries, in order: the label's ``for`` target, an input nested in the label,
+    an input in the label's parent container, then the next input in the DOM.
+    """
+    subs = [s.casefold() for s in label_substrings]
+    for lbl in scope.find_elements(By.TAG_NAME, "label"):
+        try:
+            txt = " ".join((lbl.text or "").split()).casefold()
+        except StaleElementReferenceException:
+            continue
+        if not txt or not any(s in txt for s in subs):
+            continue
+        fid = lbl.get_attribute("for")
+        if fid:
+            try:
+                el = driver.find_element(By.ID, fid)
+                if el.tag_name in ("input", "textarea") and _is_visible(el):
+                    return el
+            except NoSuchElementException:
+                pass
+        for el in lbl.find_elements(By.CSS_SELECTOR, "input, textarea"):
+            if _is_visible(el):
+                return el
+        try:
+            parent = lbl.find_element(By.XPATH, "..")
+            for el in parent.find_elements(By.CSS_SELECTOR, "input, textarea"):
+                if _is_visible(el):
+                    return el
+        except (NoSuchElementException, StaleElementReferenceException):
+            pass
+        for el in lbl.find_elements(By.XPATH, "following::input[1] | following::textarea[1]"):
+            if _is_visible(el):
+                return el
+    return None
+
+
+def _describe_inputs(scope, limit: int = 25) -> list[str]:
+    """Compact description of visible form fields, for actionable errors."""
+    out: list[str] = []
+    for el in scope.find_elements(By.CSS_SELECTOR, "input, textarea, select"):
+        try:
+            if not _is_visible(el):
+                continue
+            tag = el.tag_name
+            typ = (el.get_attribute("type") or "").strip()
+            ph = (el.get_attribute("placeholder") or "").strip()
+            name = (el.get_attribute("name") or "").strip()
+            out.append(f"{tag}[type={typ or '-'} ph='{ph}' name='{name}']")
+        except StaleElementReferenceException:
+            continue
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _fill_field(driver, scope, placeholders, labels, value, field_name, required=True) -> bool:
+    """Fill a field found by placeholder first, then by its <label> text."""
     el = _find_input_by_placeholder(scope, placeholders)
     if el is None:
+        el = _find_input_by_label(driver, scope, labels)
+    if el is None:
         if required:
-            raise SignupError(f"Could not find the '{field_name}' field on the sign-up form.")
+            fields = ", ".join(_describe_inputs(scope)) or "(no visible fields)"
+            raise SignupError(
+                f"Could not find the '{field_name}' field on the sign-up form. "
+                f"The visible fields I saw were: [{fields}]. Share this so the "
+                f"SIGNUP_* selectors can be set exactly."
+            )
         return False
     _fill_element(el, value)
     return True
@@ -748,19 +813,19 @@ def do_signup(
 
     scope = _signup_scope(driver)
     say("Filling registration form...")
-    _fill_placeholder_field(scope, selectors.SIGNUP_FIRST_NAME_PLACEHOLDERS, profile.first_name, "first name")
-    _fill_placeholder_field(scope, selectors.SIGNUP_LAST_NAME_PLACEHOLDERS, profile.last_name, "last name")
-    _fill_placeholder_field(scope, selectors.SIGNUP_EMAIL_PLACEHOLDERS, profile.email, "email")
-    _fill_placeholder_field(scope, selectors.SIGNUP_PHONE_PLACEHOLDERS, profile.phone, "phone", required=False)
+    _fill_field(driver, scope, selectors.SIGNUP_FIRST_NAME_PLACEHOLDERS, selectors.SIGNUP_FIRST_NAME_LABELS, profile.first_name, "first name")
+    _fill_field(driver, scope, selectors.SIGNUP_LAST_NAME_PLACEHOLDERS, selectors.SIGNUP_LAST_NAME_LABELS, profile.last_name, "last name")
+    _fill_field(driver, scope, selectors.SIGNUP_EMAIL_PLACEHOLDERS, selectors.SIGNUP_EMAIL_LABELS, profile.email, "email")
+    _fill_field(driver, scope, selectors.SIGNUP_PHONE_PLACEHOLDERS, selectors.SIGNUP_PHONE_LABELS, profile.phone, "phone", required=False)
 
-    # Mailing address (shared across the batch; only fill what was provided).
+    # Mailing address (city/state/postal from your input; street is random).
     if profile.street:
-        _fill_placeholder_field(scope, selectors.SIGNUP_STREET_PLACEHOLDERS, profile.street, "street", required=False)
+        _fill_field(driver, scope, selectors.SIGNUP_STREET_PLACEHOLDERS, selectors.SIGNUP_STREET_LABELS, profile.street, "street", required=False)
     if profile.city:
-        _fill_placeholder_field(scope, selectors.SIGNUP_CITY_PLACEHOLDERS, profile.city, "city", required=False)
+        _fill_field(driver, scope, selectors.SIGNUP_CITY_PLACEHOLDERS, selectors.SIGNUP_CITY_LABELS, profile.city, "city", required=False)
     if profile.postal_code:
-        _fill_placeholder_field(scope, selectors.SIGNUP_POSTAL_PLACEHOLDERS, profile.postal_code, "postal code", required=False)
-    _fill_placeholder_field(scope, selectors.SIGNUP_NICKNAME_PLACEHOLDERS, profile.nickname, "nickname", required=False)
+        _fill_field(driver, scope, selectors.SIGNUP_POSTAL_PLACEHOLDERS, selectors.SIGNUP_POSTAL_LABELS, profile.postal_code, "postal code", required=False)
+    _fill_field(driver, scope, selectors.SIGNUP_NICKNAME_PLACEHOLDERS, selectors.SIGNUP_NICKNAME_LABELS, profile.nickname, "nickname", required=False)
 
     # Country (defaults to United States) + State selects, found by their
     # option contents so we don't depend on Wicket ids or label order.
