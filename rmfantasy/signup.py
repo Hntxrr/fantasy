@@ -50,6 +50,22 @@ NICKNAME_WORDS = [
     "gate", "podium", "checkers", "wildcard", "clutch", "apex", "rhythm",
 ]
 
+# Street name pools for a random, plausible mailing street each signup.
+STREET_NAMES = [
+    "Maple", "Oak", "Pine", "Cedar", "Elm", "Willow", "Birch", "Aspen",
+    "Sunset", "Sunrise", "Hillcrest", "Meadow", "Ridge", "Valley", "Lake",
+    "River", "Creek", "Spring", "Highland", "Fairview", "Park", "Church",
+    "Washington", "Lincoln", "Jefferson", "Madison", "Franklin", "Jackson",
+    "Cherry", "Chestnut", "Walnut", "Spruce", "Dogwood", "Magnolia",
+    "Canyon", "Prairie", "Sierra", "Summit", "Cobblestone", "Harbor",
+    "Bridge", "Mill", "Union", "Liberty", "Victory", "Orchard", "Brookside",
+]
+
+STREET_SUFFIXES = [
+    "St", "Ave", "Blvd", "Ln", "Dr", "Rd", "Ct", "Way", "Pl", "Ter",
+    "Cir", "Trail", "Loop", "Pkwy", "Run", "Pass",
+]
+
 
 @dataclass
 class SignupIdentity:
@@ -60,19 +76,20 @@ class SignupIdentity:
     phone: str
     nickname: str
     password: str
+    street: str
 
 
 @dataclass
 class SignupProfile:
     """Everything needed to fill the registration form for one email.
 
-    The address fields are shared across a batch; the identity fields are
-    generated per email. ``country`` defaults to the United States.
+    City / state / postal are shared across a batch (from your input); the
+    identity fields -- including a randomized street -- are generated per email.
+    ``country`` defaults to the United States.
     """
 
     email: str
     identity: SignupIdentity
-    street: str = ""
     city: str = ""
     state: str = ""
     postal_code: str = ""
@@ -98,6 +115,10 @@ class SignupProfile:
     @property
     def password(self) -> str:
         return self.identity.password
+
+    @property
+    def street(self) -> str:
+        return self.identity.street
 
 
 @dataclass
@@ -135,6 +156,19 @@ def _random_password(rng: random.Random, length: int = 14) -> str:
     return "".join(chars)
 
 
+def random_street(rng: Optional[random.Random] = None) -> str:
+    """A random US street line: '<number> <Name> <Suffix>' e.g. '742 Willow Ln'."""
+    rng = rng or random.Random()
+    number = rng.randint(10, 9999)
+    name = rng.choice(STREET_NAMES)
+    # Occasionally use a numbered street name like '3rd' for variety.
+    if rng.random() < 0.15:
+        n = rng.randint(1, 120)
+        suffix_word = {1: "st", 2: "nd", 3: "rd"}.get(n % 10 if n % 100 not in (11, 12, 13) else 0, "th")
+        name = f"{n}{suffix_word}"
+    return f"{number} {name} {rng.choice(STREET_SUFFIXES)}"
+
+
 def _random_nickname(rng: random.Random, first_name: str) -> str:
     """A leaderboard nickname like 'holeshot_42' or 'ryanRacer'."""
     word = rng.choice(NICKNAME_WORDS)
@@ -157,24 +191,27 @@ def generate_identity(rng: Optional[random.Random] = None) -> SignupIdentity:
         phone=_random_phone(rng),
         nickname=_random_nickname(rng, first),
         password=_random_password(rng),
+        street=random_street(rng),
     )
 
 
 def build_profile(
     email: str,
     *,
-    street: str = "",
     city: str = "",
     state: str = "",
     postal_code: str = "",
     country: str = "United States",
     rng: Optional[random.Random] = None,
 ) -> SignupProfile:
-    """Create a full :class:`SignupProfile` for one email + shared address."""
+    """Create a full :class:`SignupProfile` for one email + shared address.
+
+    City / state / postal come from your input; the street is randomized per
+    account (as is the name / phone / nickname / password).
+    """
     return SignupProfile(
         email=email.strip(),
         identity=generate_identity(rng),
-        street=street.strip(),
         city=city.strip(),
         state=state.strip(),
         postal_code=postal_code.strip(),

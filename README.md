@@ -17,11 +17,12 @@ tooling required.
   time) into SQLite. Each account gets an **isolated Chrome profile**
   (`--user-data-dir`) so cookies/sessions never collide. Sessions persist, so
   after the first login the bot detects *"already logged in"* and skips login.
-- **Bulk sign-up** — paste a list of emails + one shared mailing address; the
-  bot fabricates a random name, phone, nickname and strong password for each,
-  ticks *"I am 18 or older"*, submits the registration, then saves the new
-  `email:password` to `signups.txt` and drops the account straight into
-  **Accounts** already logged in.
+- **Bulk sign-up** — paste a list of emails + your city/state/postal; the bot
+  fabricates a random name, phone, nickname, strong password **and street
+  address** for each, ticks *"I am 18 or older"*, submits the registration,
+  then saves the new `email:password` to `signups.txt` and adds the account to
+  **Accounts** (as *not signed in*, so it sits at the bottom until a login/pick
+  run confirms it).
 - **Fuzzy rider-name resolution** — you type partials/first names/typos; the app
   scrapes the site's rider dropdown once and resolves them:
   `Jett → Jett Lawrence`, `Jordan smith → Jordon Smith`,
@@ -80,16 +81,20 @@ it can't be cross-compiled from Linux/macOS.)
 Need fresh accounts? On the **Sign Up** tab:
 
 1. Paste the **emails** you want to register (one per line).
-2. Fill the **shared mailing address** — Street, City, **State** (dropdown),
-   Postal code. **Country** defaults to *United States*.
+2. Fill the shared **City**, **State** (dropdown) and **Postal code**.
+   **Country** defaults to *United States*. The **street address is randomized**
+   for each account automatically.
 3. Set options (keep **Concurrent browsers** low — 1–2 — with a 6–10s stagger
-   from a single IP), then click **SIGN UP ALL**.
+   from a single IP; **Keep browser open after submit** gives the registration
+   time to finish before the window closes), then click **SIGN UP ALL**.
 
-For each email the bot generates a random first/last name, phone, nickname and
-a strong password, ticks *"I am 18 or older"*, and submits the form. On success
-the `email:password` is appended to `signups.txt` (see *Where data lives*) and
-the account appears in **Accounts** already logged in. Emails that already exist
-as accounts are skipped; a signup that fails is rolled back (no orphan account).
+For each email the bot generates a random first/last name, phone, nickname,
+strong password and street address, ticks *"I am 18 or older"*, and submits the
+form. On success the `email:password` is appended to `signups.txt` (see *Where
+data lives*) and the account is added to **Accounts** as *not signed in* (it
+sits at the bottom of the list until a login/pick run confirms the session).
+Emails that already exist as accounts are skipped; a signup that fails is rolled
+back (no orphan account).
 
 > The registration form is located by field **placeholder/label text** (not the
 > site's volatile Wicket ids). If the site changes its wording, tweak the

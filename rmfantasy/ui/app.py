@@ -482,8 +482,9 @@ class App(ctk.CTk):
         ).grid(row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(12, 6))
 
         ctk.CTkLabel(addr, text="Street:", text_color=FG_MUTED).grid(row=1, column=0, sticky="w", padx=(14, 6), pady=5)
-        self.su_street = ctk.CTkEntry(addr, fg_color=SURFACE, border_color=BORDER)
-        self.su_street.grid(row=1, column=1, sticky="ew", padx=(0, 14), pady=5)
+        ctk.CTkLabel(
+            addr, text="\U0001F3B2 randomized each account", text_color=BRAND, anchor="w",
+        ).grid(row=1, column=1, sticky="ew", padx=(0, 14), pady=5)
 
         ctk.CTkLabel(addr, text="City:", text_color=FG_MUTED).grid(row=2, column=0, sticky="w", padx=(14, 6), pady=5)
         self.su_city = ctk.CTkEntry(addr, fg_color=SURFACE, border_color=BORDER)
@@ -519,12 +520,12 @@ class App(ctk.CTk):
         # --- Options ----------------------------------------------------- #
         opts = ctk.CTkFrame(tab, fg_color=SURFACE)
         opts.grid(row=2, column=0, columnspan=2, sticky="ew", padx=PAD, pady=(0, PAD))
-        opts.grid_columnconfigure(7, weight=1)
+        opts.grid_columnconfigure(9, weight=1)
 
         ctk.CTkLabel(opts, text="Concurrent browsers:").grid(row=0, column=0, padx=(8, 4), pady=8)
         self.su_conc_value = ctk.CTkLabel(opts, text="1", width=28)
         self.su_conc_slider = ctk.CTkSlider(
-            opts, from_=1, to=8, number_of_steps=7, width=130,
+            opts, from_=1, to=8, number_of_steps=7, width=120,
             command=lambda v: self.su_conc_value.configure(text=str(int(v))),
         )
         self.su_conc_slider.set(1)
@@ -536,9 +537,14 @@ class App(ctk.CTk):
         self.su_stagger_entry.insert(0, "6")
         self.su_stagger_entry.grid(row=0, column=4, padx=4)
 
+        ctk.CTkLabel(opts, text="Keep browser open after submit (s):").grid(row=0, column=5, padx=(8, 4))
+        self.su_keepopen_entry = ctk.CTkEntry(opts, width=54)
+        self.su_keepopen_entry.insert(0, "5")
+        self.su_keepopen_entry.grid(row=0, column=6, padx=4)
+
         self.su_headless_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(opts, text="Headless", variable=self.su_headless_var
-                        ).grid(row=0, column=5, padx=12)
+                        ).grid(row=0, column=7, padx=12)
 
         ctk.CTkLabel(opts, text="Proxies (one host:port per line, optional; round-robin):"
                      ).grid(row=1, column=0, columnspan=8, sticky="w", padx=8, pady=(4, 0))
@@ -648,10 +654,13 @@ class App(ctk.CTk):
             stagger = float(self.su_stagger_entry.get() or "6")
         except ValueError:
             stagger = 6.0
+        try:
+            keep_open = float(self.su_keepopen_entry.get() or "5")
+        except ValueError:
+            keep_open = 5.0
         proxies = [ln.strip() for ln in self.su_proxy_box.get("1.0", "end").splitlines() if ln.strip()]
 
         self.signup_runner = SignupRunner(
-            street=self.su_street.get().strip(),
             city=self.su_city.get().strip(),
             state=state,
             postal_code=self.su_postal.get().strip(),
@@ -660,6 +669,7 @@ class App(ctk.CTk):
             headless=self.su_headless_var.get(),
             launch_stagger=stagger,
             proxies=proxies,
+            post_submit_dwell=keep_open,
         )
         self.signup_progress.set(0)
         self.signup_progress_lbl.configure(text=f"0 / {len(emails)}")

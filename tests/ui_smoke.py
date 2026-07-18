@@ -131,7 +131,7 @@ def _fake_session(profile_dir, headless=False, proxy=None):
     yield object()
 
 
-def _fake_do_signup(driver, profile, status_cb=None, timeout=30):
+def _fake_do_signup(driver, profile, status_cb=None, timeout=30, post_submit_dwell=0):
     if status_cb:
         status_cb("mock: filling form")
     if profile.email.startswith("fail"):
@@ -143,8 +143,8 @@ _runnermod.automation.do_signup = _fake_do_signup
 
 before = app2.repo.count_accounts()
 sr = _runnermod.SignupRunner(
-    street="1 A St", city="Provo", state="Utah", postal_code="84601",
-    concurrency=1, launch_stagger=0,
+    city="Provo", state="Utah", postal_code="84601",
+    concurrency=1, launch_stagger=0, post_submit_dwell=0,
 )
 results = {r.email: r for r in sr.run(["new1@ex.com", "fail2@ex.com", "user0@ex.com"])}
 print("signup success (expect True):",

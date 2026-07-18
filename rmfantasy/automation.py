@@ -718,6 +718,7 @@ def do_signup(
     profile: SignupProfile,
     status_cb: Optional[StatusCallback] = None,
     timeout: int = 30,
+    post_submit_dwell: float = 4.0,
 ) -> None:
     """Register a brand-new account from a :class:`SignupProfile`.
 
@@ -802,8 +803,27 @@ def do_signup(
             "SIGNUP_SUBMIT_TEXTS / SIGNUP_SUBMIT_CSS in selectors.py."
         )
 
+    # Give the (AJAX) registration request time to actually reach the server
+    # before we inspect the result or close the browser.
+    time.sleep(2.0)
+
+    # Surface an inline validation error the form shows on a rejected submit
+    # (e.g. weak password, duplicate email, missing required field).
+    err = _find_first_visible(driver, [selectors.SIGNUP_ERROR_CSS])
+    if err is not None and (err.text or "").strip():
+        raise SignupError(f"Registration rejected: {' '.join(err.text.split())[:200]}")
+
     say("Confirming registration...")
-    if not _confirm_signup(driver, timeout=timeout):
+    confirmed = _confirm_signup(driver, timeout=timeout)
+
+    # Keep the browser open a moment AFTER submitting so the account-creation
+    # request finishes -- closing too quickly can cancel it in flight, which
+    # looks like "it submitted but no account was made".
+    if post_submit_dwell > 0:
+        say(f"Submitted - holding browser open {post_submit_dwell:g}s to finish...")
+        time.sleep(post_submit_dwell)
+
+    if not confirmed:
         err = _find_first_visible(driver, [selectors.SIGNUP_ERROR_CSS])
-        detail = f" Site said: {err.text.strip()}" if err and err.text.strip() else ""
+        detail = f" Site said: {' '.join(err.text.split())[:200]}" if err and (err.text or "").strip() else ""
         raise SignupError(f"Registration submitted but not confirmed.{detail}")

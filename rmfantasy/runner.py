@@ -279,7 +279,6 @@ class SignupRunner:
     def __init__(
         self,
         *,
-        street: str = "",
         city: str = "",
         state: str = "",
         postal_code: str = "",
@@ -289,8 +288,8 @@ class SignupRunner:
         launch_stagger: float = 6.0,
         proxies: Optional[list[str]] = None,
         signup_timeout: int = 45,
+        post_submit_dwell: float = 4.0,
     ) -> None:
-        self.street = street
         self.city = city
         self.state = state
         self.postal_code = postal_code
@@ -300,6 +299,7 @@ class SignupRunner:
         self.launch_stagger = max(0.0, launch_stagger)
         self.proxies = [p for p in (proxies or []) if p.strip()]
         self.signup_timeout = signup_timeout
+        self.post_submit_dwell = max(0.0, post_submit_dwell)
 
         self._cipher = CredentialCipher()
         self._launch_lock = threading.Lock()
@@ -365,7 +365,7 @@ class SignupRunner:
 
             profile = build_profile(
                 email,
-                street=self.street, city=self.city, state=self.state,
+                city=self.city, state=self.state,
                 postal_code=self.postal_code, country=self.country,
             )
             label = email.split("@", 1)[0]
@@ -380,7 +380,11 @@ class SignupRunner:
             with automation.chrome_session(
                 account.profile_dir, headless=self.headless, proxy=proxy
             ) as driver:
-                automation.do_signup(driver, profile, status_cb=status, timeout=self.signup_timeout)
+                automation.do_signup(
+                    driver, profile, status_cb=status,
+                    timeout=self.signup_timeout,
+                    post_submit_dwell=self.post_submit_dwell,
+                )
 
             # Registered and saved to Accounts, but left as "not signed in" so
             # it appears at the BOTTOM of the list until a real login/pick run
