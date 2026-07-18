@@ -578,6 +578,11 @@ class App(ctk.CTk):
             height=40, width=80, state="disabled", command=self.on_signup_stop,
         )
         self.signup_stop_btn.pack(side="left", padx=4)
+        self.test_proxy_btn = ctk.CTkButton(
+            actions, text="Test proxy", fg_color=NEUTRAL, hover_color=NEUTRAL_HOV,
+            height=40, width=100, command=self.on_test_proxy,
+        )
+        self.test_proxy_btn.pack(side="left", padx=4)
         self.signup_progress = ctk.CTkProgressBar(actions, width=220)
         self.signup_progress.set(0)
         self.signup_progress.pack(side="left", padx=12)
@@ -706,6 +711,34 @@ class App(ctk.CTk):
         if self.signup_runner:
             self.signup_runner.cancel()
             self.signup_stop_btn.configure(state="disabled", text="Stopping...")
+
+    def on_test_proxy(self) -> None:
+        """Open a browser through the first proxy and report its public IP."""
+        proxies = [ln.strip() for ln in self.su_proxy_box.get("1.0", "end").splitlines() if ln.strip()]
+        proxy = proxies[0] if proxies else None
+        if not proxy:
+            messagebox.showinfo(
+                "No proxy", "Add a proxy line first (host:port or host:port:user:pass).")
+            return
+        self.test_proxy_btn.configure(state="disabled", text="Testing...")
+        self.signup_status_lbl.configure(text=f"Opening browser through proxy {proxy.split(':')[0]}...")
+        threading.Thread(target=self._test_proxy_worker, args=(proxy,), daemon=True).start()
+
+    def _test_proxy_worker(self, proxy: str) -> None:
+        import tempfile
+        prof = tempfile.mkdtemp(prefix="rm_proxytest_")
+        try:
+            driver = automation.build_driver(prof, headless=False, proxy=proxy)
+            try:
+                ip = automation.get_public_ip(driver)
+            finally:
+                try:
+                    driver.quit()
+                except Exception:  # noqa: BLE001
+                    pass
+            self.events.put(("proxy_ip", ip or "(could not read IP)"))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("proxy_err", str(exc)))
 
     def _set_signup_running(self, running: bool) -> None:
         self.signup_btn.configure(state="disabled" if running else "normal")
@@ -1579,6 +1612,22 @@ class App(ctk.CTk):
         elif kind == "su_run_error":
             self._on_signup_finished()
             messagebox.showerror("Sign-up error", evt[1])
+        elif kind == "proxy_ip":
+            self.test_proxy_btn.configure(state="normal", text="Test proxy")
+            self.signup_status_lbl.configure(text=f"Proxy public IP: {evt[1]}")
+            messagebox.showinfo(
+                "Proxy test",
+                f"The browser's public IP through the proxy was:\n\n{evt[1]}\n\n"
+                "If this is NOT your normal home IP, the proxy is working.",
+            )
+        elif kind == "proxy_err":
+            self.test_proxy_btn.configure(state="normal", text="Test proxy")
+            self.signup_status_lbl.configure(text="Proxy test failed.")
+            messagebox.showerror(
+                "Proxy test failed",
+                f"Could not load a page through the proxy:\n\n{evt[1]}\n\n"
+                "Check the host:port:user:pass and that the proxy is active.",
+            )
 
     def _update_run_row(self, account_id: int, status: str, tag: str, remember: bool = True):
         iid = self._run_row_by_account.get(account_id)

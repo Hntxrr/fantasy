@@ -233,6 +233,25 @@ def _new_chrome(opts: Options) -> webdriver.Chrome:
         return webdriver.Chrome(options=opts)
 
 
+def get_public_ip(driver, timeout: int = 25) -> str:
+    """Return the browser's public IP (via an echo service) to verify a proxy."""
+    for url in ("https://api.ipify.org?format=json", "https://ifconfig.me/ip"):
+        try:
+            driver.set_page_load_timeout(timeout)
+            driver.get(url)
+            body = driver.find_element(By.TAG_NAME, "body").text.strip()
+            if "{" in body and "ip" in body:
+                try:
+                    return json.loads(body).get("ip", "").strip() or body[:60]
+                except Exception:  # noqa: BLE001
+                    pass
+            if body:
+                return body.split()[0][:60]
+        except Exception:  # noqa: BLE001
+            continue
+    return ""
+
+
 @contextmanager
 def chrome_session(profile_dir: str, headless: bool = False, proxy: Optional[str] = None):
     driver = build_driver(profile_dir, headless=headless, proxy=proxy)
@@ -919,56 +938,78 @@ def _scroll_and_click(driver, el) -> None:
     _click(driver, el)
 
 
-def _click_signup_submit(driver) -> bool:
-    """Click the registration Submit button, tolerating styled / re-rendered
-    buttons (mirrors the tolerant 'open sign-up' logic).
+def _element_label(el) -> str:
+    try:
+        raw = el.get_attribute("value") if el.tag_name == "input" else el.text
+        return " ".join((raw or "").split())[:30]
+    except Exception:  # noqa: BLE001
+        return ""
 
-    Returns True if a submit-like control was clicked. Searches the signup
-    modal scope first, then the whole page; matches by CSS, then by text
-    *containing* 'submit' (or the configured texts), shortest label first.
+
+def _find_submit_button(driver):
+    """Locate the registration Submit control.
+
+    Priority: explicit CSS -> EXACT text match on a real button/link/input
+    (the approach that worked previously) -> a styled element whose text
+    *contains* 'submit'. We deliberately do NOT match 'sign up' here so we
+    can't accidentally re-click the header 'SIGN UP' trigger.
     """
     el = _find_first_visible(driver, [selectors.SIGNUP_SUBMIT_CSS])
     if el is not None:
-        _scroll_and_click(driver, el)
-        return True
+        return el
 
-    subs = [s.casefold() for s in selectors.SIGNUP_SUBMIT_TEXTS] + ["submit"]
-    exclude = ("log in", "login", "sign in", "cancel", "close", "reset", "back")
     scope = _signup_scope(driver)
-    roots = [scope] if scope is not driver else [driver]
-    if scope is not driver:
-        roots.append(driver)  # fall back to whole page if scoped search misses
+    roots = [scope, driver] if scope is not driver else [driver]
+
+    # Exact text match on real controls, in PRIORITY order (so 'Submit' wins
+    # over 'Sign Up' -- we must not re-click the header 'SIGN UP' trigger).
+    for want in [t.casefold() for t in selectors.SIGNUP_SUBMIT_TEXTS]:
+        for root in roots:
+            for tag in ("button", "input", "a"):
+                for e in root.find_elements(By.TAG_NAME, tag):
+                    try:
+                        if not e.is_displayed() or not e.is_enabled():
+                            continue
+                        raw = e.get_attribute("value") if tag == "input" else e.text
+                        if " ".join((raw or "").split()).casefold() == want:
+                            return e
+                    except StaleElementReferenceException:
+                        continue
+
+    # Fallback: any visible element whose text contains 'submit'.
+    exclude = ("log in", "login", "sign in", "cancel", "close", "reset", "back")
     for root in roots:
         cands: list[tuple[int, object]] = []
-        seen: set[tuple[str, str]] = set()
         for tag in ("button", "input", "a", "span", "div"):
             for e in root.find_elements(By.TAG_NAME, tag):
                 try:
                     if not e.is_displayed():
                         continue
                     raw = e.get_attribute("value") if tag == "input" else e.text
-                    t = " ".join((raw or "").split())
-                    low = t.casefold()
-                    if not low or len(low) > 30:
+                    low = " ".join((raw or "").split()).casefold()
+                    if not low or len(low) > 24 or any(x in low for x in exclude):
                         continue
-                    if any(x in low for x in exclude):
-                        continue
-                    if any(s in low for s in subs):
-                        key = (tag, t)
-                        if key in seen:
-                            continue
-                        seen.add(key)
+                    if "submit" in low:
                         cands.append((len(low), e))
                 except StaleElementReferenceException:
                     continue
         cands.sort(key=lambda pair: pair[0])
-        for _, e in cands:
-            try:
-                _scroll_and_click(driver, e)
-                return True
-            except Exception:  # noqa: BLE001
-                continue
-    return False
+        if cands:
+            return cands[0][1]
+    return None
+
+
+def _click_signup_submit(driver, status_cb: Optional[StatusCallback] = None) -> bool:
+    """Click the Submit control and report exactly what was clicked."""
+    say = status_cb or (lambda _m: None)
+    el = _find_submit_button(driver)
+    if el is None:
+        say("Could not find a Submit button to click.")
+        return False
+    label = _element_label(el)
+    _scroll_and_click(driver, el)
+    say(f"Clicked Submit ('{label or el.tag_name}').")
+    return True
 
 
 def _is_fatal_signup_error(text: str) -> bool:
@@ -1072,7 +1113,7 @@ def do_signup(
     # a real rejection (duplicate email, weak password, etc.) or once confirmed.
     attempts = max(1, submit_attempts)
     say(f"Submitting registration (try 1/{attempts})...")
-    if not _click_signup_submit(driver):
+    if not _click_signup_submit(driver, status_cb=say):
         raise SignupError(
             "Could not find the registration Submit button. Check "
             "SIGNUP_SUBMIT_TEXTS / SIGNUP_SUBMIT_CSS in selectors.py."
@@ -1100,7 +1141,7 @@ def do_signup(
             # Re-assert 18+ (the re-render may clear it), then re-click Submit.
             _check_age_radio(driver, selectors.SIGNUP_AGE_OK_LABEL_CONTAINS)
             time.sleep(submit_retry_delay)
-            if not _click_signup_submit(driver):
+            if not _click_signup_submit(driver, status_cb=say):
                 say("Warning: could not find the Submit button to re-click.")
 
     if not confirmed:
