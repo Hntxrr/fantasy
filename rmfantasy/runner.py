@@ -76,7 +76,7 @@ class ConcurrentRunner:
         login_timeout: int = 30,
         submit_retries: int = 2,
         retry_delay: float = 3.0,
-        post_submit_dwell: float = 3.0,
+        post_submit_dwell: float = 0.5,
     ) -> None:
         self.concurrency = max(1, min(15, concurrency))
         self.headless = headless
@@ -209,7 +209,7 @@ class ConcurrentRunner:
             automation.submit_picks(driver, request, status_cb=status, verify=True)
             # Linger on the confirmation so it's visibly submitted (visible mode only).
             if self.post_submit_dwell > 0 and not self.headless:
-                status(f"Submitted & confirmed - keeping browser open {int(self.post_submit_dwell)}s...")
+                status(f"Submitted & confirmed - closing in {self.post_submit_dwell:g}s...")
                 time.sleep(self.post_submit_dwell)
         return self._finish(
             assignment, True, "Picks submitted and confirmed.", repo, round_label=round_label

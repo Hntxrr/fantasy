@@ -88,7 +88,7 @@ built *on* Windows; it can't be cross-compiled from Linux/macOS.)
 |---------|--------------|
 | **Concurrent browsers** (1–15) | How many accounts run at once. |
 | **Launch stagger (s)** | Delay between browser launches, to avoid rate-limiting. |
-| **Keep browser open after submit (s)** | Leaves the (visible) browser open this long after a confirmed submit so you can *see* it worked before it closes. Default 3s. |
+| **Keep browser open after submit (s)** | Brief pause after a confirmed submit before the (visible) browser closes. Default 0.5s; set to 0 to close instantly, or higher if you want a longer look. |
 | **Headless** | Run without visible windows (faster; no dwell). |
 | **Start from account #** | Begin the run at this row and skip earlier ones — handy if you already submitted some accounts manually. Use **Set from selected row** to fill it from whatever row you click. |
 | **Proxies** | Optional `host:port` per line, assigned round-robin across browsers. |

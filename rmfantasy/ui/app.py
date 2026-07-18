@@ -502,7 +502,7 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(opts, text="Keep browser open after submit (s):").grid(row=0, column=5, padx=(8, 4))
         self.keepopen_entry = ctk.CTkEntry(opts, width=54)
-        self.keepopen_entry.insert(0, "3")
+        self.keepopen_entry.insert(0, "0.5")
         self.keepopen_entry.grid(row=0, column=6, padx=4)
 
         self.headless_var = ctk.BooleanVar(value=False)
