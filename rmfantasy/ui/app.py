@@ -1728,11 +1728,16 @@ class App(ctk.CTk):
         wrap.grid(row=1, column=0, sticky="nsew", padx=PAD, pady=PAD)
         wrap.grid_rowconfigure(0, weight=1)
         wrap.grid_columnconfigure(0, weight=1)
-        cols = ("time", "account", "lineup", "wildcard", "ok", "message")
+        ctk.CTkLabel(
+            bar, text="(double-click a row to see the full 5)", text_color=FG_MUTED,
+        ).pack(side="left", padx=8)
+
+        cols = ("time", "account", "lineup", "core", "wildcard", "ok", "message")
         self.history_tree = ttk.Treeview(wrap, columns=cols, show="headings")
         for c, w, t in [
-            ("time", 140, "Time"), ("account", 150, "Account"), ("lineup", 80, "Lineup"),
-            ("wildcard", 150, "Wildcard"), ("ok", 70, "Result"), ("message", 380, "Message"),
+            ("time", 130, "Time"), ("account", 130, "Account"), ("lineup", 60, "Lineup"),
+            ("core", 300, "Top 5 (1st\u21925th)"), ("wildcard", 130, "Wildcard"),
+            ("ok", 60, "Result"), ("message", 300, "Message"),
         ]:
             self.history_tree.heading(c, text=t)
             self.history_tree.column(c, width=w, anchor="w")
@@ -1740,21 +1745,53 @@ class App(ctk.CTk):
         self.history_tree.configure(yscrollcommand=vsb.set)
         self.history_tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
-        self.history_tree.tag_configure("ok", foreground="#7fdf7f")
-        self.history_tree.tag_configure("fail", foreground="#ff8a8a")
+        self.history_tree.tag_configure("ok", foreground=ROW_OK)
+        self.history_tree.tag_configure("fail", foreground=ROW_FAIL)
+        # Remember each row's full details for the double-click popup.
+        self._history_by_iid: dict[str, object] = {}
+        self.history_tree.bind("<Double-1>", lambda e: self._show_history_detail())
 
     def refresh_history(self):
         for iid in self.history_tree.get_children():
             self.history_tree.delete(iid)
+        self._history_by_iid = {}
         logs = self.repo.list_submission_logs()
-        for e in logs:
+        for i, e in enumerate(logs):
+            iid = f"hist{i}"
+            self._history_by_iid[iid] = e
             self.history_tree.insert(
-                "", "end",
-                values=(e.timestamp, e.account_label, f"#{e.round_number}", e.wildcard,
+                "", "end", iid=iid,
+                values=(e.timestamp, e.account_label, f"#{e.round_number}",
+                        e.core_five or "(not recorded)", e.wildcard,
                         "OK" if e.success else "FAIL", e.message),
                 tags=("ok" if e.success else "fail",),
             )
         self.history_count.configure(text=f"{len(logs)} submissions")
+
+    def _show_history_detail(self):
+        sel = self.history_tree.selection()
+        if not sel:
+            return
+        e = self._history_by_iid.get(sel[0])
+        if e is None:
+            return
+        riders = [r.strip() for r in (e.core_five or "").split(",") if r.strip()]
+        if riders:
+            places = ["1st", "2nd", "3rd", "4th", "5th"]
+            lines = [f"  {places[i] if i < len(places) else str(i + 1) + 'th'}: {r}"
+                     for i, r in enumerate(riders)]
+            core_txt = "\n".join(lines)
+        else:
+            core_txt = "  (the 5 riders weren't recorded for this entry)"
+        messagebox.showinfo(
+            f"Lineup #{e.round_number} - {e.account_label}",
+            f"Account: {e.account_label} ({e.account_email})\n"
+            f"Submitted: {e.timestamp}\n"
+            f"Result: {'OK' if e.success else 'FAIL'}\n\n"
+            f"Top 5 (core):\n{core_txt}\n\n"
+            f"Wild card (13th): {e.wildcard}\n\n"
+            f"{e.message}",
+        )
 
     # ================================================================== #
     # Persistence of round inputs
