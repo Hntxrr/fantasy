@@ -7,8 +7,15 @@ Run under Xvfb:  xvfb-run -a python tests/ui_smoke.py
 import os
 os.environ.setdefault("RMFANTASY_HOME", "/tmp/rmf_ui_smoke")
 
+import rmfantasy.ui.app as appmod
 from rmfantasy.ui.app import App
 from rmfantasy.assignment import build_plan
+
+# Stub modal dialogs so they don't block this headless smoke run.
+appmod.messagebox.showinfo = lambda *a, **k: None
+appmod.messagebox.showwarning = lambda *a, **k: None
+appmod.messagebox.showerror = lambda *a, **k: None
+appmod.messagebox.askyesno = lambda *a, **k: True
 
 app = App()
 
@@ -19,6 +26,7 @@ app.refresh_accounts()
 
 app.repo.set_roster([
     "Jett Lawrence", "Hunter Lawrence", "Haiden Deegan", "Eli Tomac", "Jorge Prado",
+    "Jorge Rubalcava", "Matti Jorgensen",  # make "Jorge" ambiguous
     "Jordon Smith", "Valentin Guillod", "Justin Barcia", "Mitchell Harrison",
     "Antonio Cairoli", "Cooper Webb", "Chase Sexton", "Aaron Plessinger",
 ])
@@ -29,7 +37,19 @@ app.wildcards_box.delete("1.0", "end")
 app.wildcards_box.insert("1.0", "Jordan smith\nValentine\nJustin barcia\nMitchell harrison")
 
 ok = app.on_resolve()
-print("resolve all ok:", ok)
+print("resolve all ok (expect False, Jorge ambiguous):", ok)
+print("problem queries:", list(app._problem_queries.keys()))
+
+# Build the disambiguation dialog, then apply the override programmatically.
+from rmfantasy.ui.app import DisambiguationDialog
+dlg = DisambiguationDialog(app, dict(app._problem_queries), app.resolver.roster)
+print("dialog rows:", list(dlg.rows.keys()))
+dlg.destroy()
+
+app._apply_aliases({"Jorge": "Jorge Prado"})
+print("alias saved:", app.repo.get_aliases())
+ok2 = app.on_resolve()
+print("resolve all ok after override (expect True):", ok2)
 print("preview head:", app.preview_box.get("1.0", "end").strip().splitlines()[0])
 
 lus, wcs = app._pending_resolved

@@ -74,6 +74,13 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- Name overrides: pin an ambiguous/partial query to an exact rider name.
+-- ``query`` is stored normalized (casefolded, whitespace-collapsed).
+CREATE TABLE IF NOT EXISTS name_aliases (
+    query TEXT PRIMARY KEY,
+    rider TEXT NOT NULL
+);
 """
 
 

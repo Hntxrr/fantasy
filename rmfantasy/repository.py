@@ -16,6 +16,7 @@ from typing import Optional
 
 from . import config, database
 from .crypto import CredentialCipher
+from .resolver import normalize_query
 from .models import (
     Account,
     Assignment,
@@ -240,6 +241,29 @@ class Repository:
     def get_meta(self, key: str, default: Optional[str] = None) -> Optional[str]:
         row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else default
+
+    # ------------------------------------------------------------------ #
+    # Name aliases / overrides (pin an ambiguous query to a rider)
+    # ------------------------------------------------------------------ #
+    def set_alias(self, query: str, rider: str) -> None:
+        q = normalize_query(query)
+        rider = (rider or "").strip()
+        if not q or not rider:
+            return
+        self.conn.execute(
+            "INSERT INTO name_aliases (query, rider) VALUES (?, ?) "
+            "ON CONFLICT(query) DO UPDATE SET rider = excluded.rider",
+            (q, rider),
+        )
+        self.conn.commit()
+
+    def delete_alias(self, query: str) -> None:
+        self.conn.execute("DELETE FROM name_aliases WHERE query = ?", (normalize_query(query),))
+        self.conn.commit()
+
+    def get_aliases(self) -> dict[str, str]:
+        rows = self.conn.execute("SELECT query, rider FROM name_aliases").fetchall()
+        return {r["query"]: r["rider"] for r in rows}
 
     # ------------------------------------------------------------------ #
     # Lineups

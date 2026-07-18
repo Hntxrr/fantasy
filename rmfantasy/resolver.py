@@ -31,6 +31,11 @@ def _norm(text: str) -> str:
     return " ".join((text or "").split()).strip().casefold()
 
 
+def normalize_query(text: str) -> str:
+    """Public, canonical normalization for alias keys (used by the repository)."""
+    return _norm(text)
+
+
 def _ratio(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
@@ -98,7 +103,7 @@ class ResolveResult:
 
 
 class RiderResolver:
-    def __init__(self, roster: list[str]):
+    def __init__(self, roster: list[str], aliases: dict[str, str] | None = None):
         # Dedupe while preserving order (dropdowns list each rider twice).
         seen = set()
         self.roster: list[str] = []
@@ -109,12 +114,28 @@ class RiderResolver:
                 seen.add(key)
                 self.roster.append(name)
 
+        # Map any casing of a roster name back to its exact roster spelling.
+        self._canonical = {n.casefold(): n for n in self.roster}
+
+        # User overrides: normalized query -> exact roster name. Only keep an
+        # alias if its target actually exists in the current roster.
+        self.aliases: dict[str, str] = {}
+        for query, target in (aliases or {}).items():
+            canon = self._canonical.get((target or "").strip().casefold())
+            if canon:
+                self.aliases[_norm(query)] = canon
+
     def resolve(self, query: str, top_k: int = 4) -> ResolveResult:
         query = (query or "").strip()
         if not query:
             return ResolveResult(query=query, name=None, score=0.0)
         if not self.roster:
             return ResolveResult(query=query, name=None, score=0.0)
+
+        # A saved override always wins -- definitive, never ambiguous.
+        alias_target = self.aliases.get(_norm(query))
+        if alias_target:
+            return ResolveResult(query=query, name=alias_target, score=1.0, ambiguous=False)
 
         scored = sorted(
             ((name, _name_score(query, name)) for name in self.roster),

@@ -241,6 +241,8 @@ class App(ctk.CTk):
                                         command=self.on_scrape_roster)
         self.scrape_btn.pack(side="left", padx=4)
         ctk.CTkButton(controls, text="Resolve & preview", command=self.on_resolve).pack(side="left", padx=4)
+        ctk.CTkButton(controls, text="Fix ambiguous names", fg_color="#7a5a1e",
+                      hover_color="#8f6a26", command=self.on_fix_ambiguous).pack(side="left", padx=4)
         ctk.CTkButton(controls, text="Lock in assignments", fg_color="#2c6e49",
                       hover_color="#358257", command=self.on_lock_plan).pack(side="left", padx=4)
         self.roster_lbl = ctk.CTkLabel(controls, text="Roster: (not scraped)")
@@ -268,7 +270,7 @@ class App(ctk.CTk):
                 "Scrape the rider roster from the site first (button on the left).",
             )
             return False
-        self.resolver = RiderResolver(roster)
+        self.resolver = RiderResolver(roster, self.repo.get_aliases())
         return True
 
     def on_resolve(self):
@@ -278,11 +280,23 @@ class App(ctk.CTk):
         self._set_preview(report)
         return ok
 
+    def _record_problem(self, query, result) -> None:
+        """Remember an ambiguous/unmatched query + its candidate riders."""
+        key = (query or "").strip()
+        if not key or key in self._problem_queries:
+            return
+        candidates = []
+        if result.name:
+            candidates.append(result.name)
+        candidates += [n for n, _ in result.alternatives]
+        self._problem_queries[key] = candidates
+
     def _build_resolution_report(self):
         """Resolve all lineups+wildcards; return (text_report, all_ok)."""
         assert self.resolver is not None
         lines = []
         all_ok = True
+        self._problem_queries = {}
 
         raw_lineups = self._parse_lineups()
         lines.append("=== LINEUPS ===")
@@ -302,6 +316,7 @@ class App(ctk.CTk):
                     names.append(r.name)
                 else:
                     all_ok = False
+                    self._record_problem(tok, r)
                     flag = "AMBIGUOUS" if r.ambiguous else "NO MATCH"
                     alts = ", ".join(n for n, _ in r.alternatives[:2])
                     parts.append(f"{tok}->[{flag}: {r.name or '?'}{(' / ' + alts) if alts else ''}]")
@@ -319,6 +334,7 @@ class App(ctk.CTk):
                 resolved_wildcards.append(r.name)
             else:
                 all_ok = False
+                self._record_problem(w, r)
                 flag = "AMBIGUOUS" if r.ambiguous else "NO MATCH"
                 alts = ", ".join(n for n, _ in r.alternatives[:2])
                 lines.append(f"{w} -> [{flag}: {r.name or '?'}{(' / ' + alts) if alts else ''}]")
@@ -333,7 +349,7 @@ class App(ctk.CTk):
         lines.insert(0, plan.summary())
         lines.insert(1, "")
         if not all_ok:
-            lines.insert(0, ">>> Some names are unresolved/ambiguous - fix them before locking in. <<<")
+            lines.insert(0, ">>> Some names are unresolved/ambiguous - click 'Fix ambiguous names' to pin them. <<<")
         return "\n".join(lines), all_ok
 
     def _set_preview(self, text: str):
@@ -341,6 +357,31 @@ class App(ctk.CTk):
         self.preview_box.delete("1.0", "end")
         self.preview_box.insert("1.0", text)
         self.preview_box.configure(state="disabled")
+
+    def on_fix_ambiguous(self):
+        if not self._ensure_resolver():
+            return
+        report, _ok = self._build_resolution_report()
+        self._set_preview(report)
+        if not self._problem_queries:
+            messagebox.showinfo(
+                "Nothing to fix",
+                "No ambiguous or unmatched names right now. If a name still "
+                "resolves to the wrong rider, you can still pin it via this dialog.",
+            )
+        DisambiguationDialog(self, dict(self._problem_queries), self.resolver.roster)
+
+    def _apply_aliases(self, mapping: dict[str, str]):
+        """Persist the user's rider choices and re-resolve."""
+        for query, rider in mapping.items():
+            if rider:
+                self.repo.set_alias(query, rider)
+        # Rebuild the resolver so the new overrides take effect immediately.
+        self.resolver = RiderResolver(self.repo.get_roster(), self.repo.get_aliases())
+        report, ok = self._build_resolution_report()
+        self._set_preview(report)
+        if ok:
+            messagebox.showinfo("Saved", "Overrides saved. All names now resolve cleanly.")
 
     def on_lock_plan(self):
         if not self._ensure_resolver():
@@ -620,7 +661,7 @@ class App(ctk.CTk):
             count = evt[1]
             self.scrape_btn.configure(state="normal", text="Scrape riders from site")
             self.roster_lbl.configure(text=f"Roster: {count} riders (updated {self.repo.roster_updated_at()})")
-            self.resolver = RiderResolver(self.repo.get_roster())
+            self.resolver = RiderResolver(self.repo.get_roster(), self.repo.get_aliases())
             messagebox.showinfo("Roster scraped", f"Cached {count} riders. You can now Resolve & preview.")
         elif kind == "scrape_error":
             self.scrape_btn.configure(state="normal", text="Scrape riders from site")
@@ -700,6 +741,63 @@ class EditAccountDialog(ctk.CTkToplevel):
         self.app.repo.update_account(self.account_id, label, email, pw or None)
         self.app.refresh_accounts()
         self.destroy()
+
+
+class DisambiguationDialog(ctk.CTkToplevel):
+    """Pick the correct rider for each ambiguous/unmatched name.
+
+    Choices are saved as persistent aliases, so e.g. 'Jorge' -> 'Jorge Prado'
+    is remembered for every future round.
+    """
+
+    def __init__(self, app: "App", problems: dict[str, list[str]], roster: list[str]):
+        super().__init__(app)
+        self.app = app
+        self.title("Fix ambiguous / unmatched names")
+        self.geometry("600x540")
+        self.grab_set()
+
+        ctk.CTkLabel(
+            self,
+            text="Pick the correct rider for each name below. Your choices are "
+                 "saved and reused automatically every round. You can also type "
+                 "to search the dropdown.",
+            wraplength=560, justify="left",
+        ).pack(padx=16, pady=(16, 8), anchor="w")
+
+        frame = ctk.CTkScrollableFrame(self, height=380)
+        frame.pack(fill="both", expand=True, padx=16, pady=8)
+
+        self.rows: dict[str, ctk.CTkComboBox] = {}
+        if not problems:
+            ctk.CTkLabel(frame, text="(nothing flagged - pin any name manually below is unavailable)"
+                         ).pack(anchor="w", pady=6)
+
+        for query, candidates in problems.items():
+            row = ctk.CTkFrame(frame, fg_color="transparent")
+            row.pack(fill="x", pady=4)
+            ctk.CTkLabel(row, text=query, width=150, anchor="w").pack(side="left", padx=(0, 8))
+            # Candidates first (best guesses), then the rest of the roster.
+            opts, seen = [], set()
+            for c in list(candidates) + list(roster):
+                if c and c not in seen:
+                    seen.add(c)
+                    opts.append(c)
+            combo = ctk.CTkComboBox(row, values=opts, width=360)
+            combo.set(candidates[0] if candidates else (opts[0] if opts else ""))
+            combo.pack(side="left")
+            self.rows[query] = combo
+
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.pack(fill="x", padx=16, pady=12)
+        ctk.CTkButton(btns, text="Save choices", fg_color="#2c6e49", hover_color="#358257",
+                      command=self._save).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Cancel", command=self.destroy).pack(side="left", padx=4)
+
+    def _save(self):
+        mapping = {q: combo.get().strip() for q, combo in self.rows.items()}
+        self.destroy()
+        self.app._apply_aliases(mapping)
 
 
 def main() -> None:

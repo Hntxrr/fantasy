@@ -86,3 +86,29 @@ def test_resolve_lineup_line(resolver):
 def test_empty_roster():
     r = RiderResolver([])
     assert r.resolve("Jett").name is None
+
+
+def test_alias_overrides_ambiguous(resolver):
+    # Without an override, a shared first name is ambiguous.
+    assert resolver.resolve("Justin").ambiguous is True
+    # With an override, it resolves definitively.
+    r = RiderResolver(ROSTER, aliases={"Justin": "Justin Barcia"})
+    res = r.resolve("Justin")
+    assert res.name == "Justin Barcia"
+    assert res.ok is True
+    assert res.ambiguous is False
+
+
+def test_alias_case_insensitive_and_canonicalized():
+    roster = ["Jorge Prado", "Jorge Rubalcava", "Matti Jorgensen"]
+    # Alias key any-case, target any-case -> canonical roster spelling returned.
+    r = RiderResolver(roster, aliases={"JORGE": "jorge prado"})
+    res = r.resolve("jorge")
+    assert res.name == "Jorge Prado"
+    assert res.ok
+
+
+def test_alias_ignored_if_target_not_in_roster():
+    r = RiderResolver(["Jett Lawrence"], aliases={"jorge": "Jorge Prado"})
+    # Target isn't in this roster, so the alias is dropped (query stays unresolved).
+    assert "jorge" not in r.aliases

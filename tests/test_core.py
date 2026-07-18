@@ -263,3 +263,16 @@ def test_roster_and_meta(repo):
     repo.set_meta("round_lineups_text", "Jett Hunter Haiden Eli Jorge")
     assert repo.get_meta("round_lineups_text") == "Jett Hunter Haiden Eli Jorge"
     assert repo.get_meta("missing", "default") == "default"
+
+
+def test_name_aliases(repo):
+    # Stored normalized (casefold + whitespace-collapsed), upsert on conflict.
+    repo.set_alias("  Jorge  ", "Jorge Prado")
+    assert repo.get_aliases() == {"jorge": "Jorge Prado"}
+    repo.set_alias("JORGE", "Jorge Rubalcava")   # same normalized key -> update
+    assert repo.get_aliases() == {"jorge": "Jorge Rubalcava"}
+    repo.set_alias("", "Nobody")                 # ignored
+    repo.set_alias("x", "")                       # ignored
+    assert repo.get_aliases() == {"jorge": "Jorge Rubalcava"}
+    repo.delete_alias("Jorge")
+    assert repo.get_aliases() == {}
