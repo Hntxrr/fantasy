@@ -1557,15 +1557,15 @@ def assist_login(
     status_cb: Optional[StatusCallback] = None,
     timeout: int = 30,
     wait_timeout: int = 600,
-    autofill: bool = False,
+    autofill: bool = True,
 ) -> None:
-    """Assisted login. By default the tool does NOT type your credentials (a
-    purely human login is less likely to trip the reCAPTCHA); it shows them in a
-    copyable panel for you to paste. Set ``autofill=True`` to have it type them.
+    """Assisted login. By default the tool auto-fills your email + password and
+    also shows them in a copyable panel; you click Log In + clear the captcha.
+    Set ``autofill=False`` to only show the credentials (no typing).
 
-    You click Log In + clear the captcha; success is auto-detected (rider
-    dropdowns become editable) or you click 'Logged in'. The session persists in
-    the Chrome profile so later pick runs reuse it (no re-login).
+    Success is auto-detected (rider dropdowns become editable) or you click
+    'Logged in'. The session persists in the Chrome profile so later pick runs
+    reuse it (no re-login).
     """
     say = status_cb or (lambda _m: None)
 

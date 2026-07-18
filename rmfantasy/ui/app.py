@@ -199,9 +199,11 @@ class App(ctk.CTk):
         self.scrape_thread: threading.Thread | None = None
         self.signup_thread: threading.Thread | None = None
         self.signin_thread: threading.Thread | None = None
+        self.assist_thread: threading.Thread | None = None
         self.runner: ConcurrentRunner | None = None
         self.signup_runner: SignupRunner | None = None
         self.signin_runner: SigninRunner | None = None
+        self.assist_runner: SigninRunner | None = None
         self._su_row_by_email: dict[str, str] = {}
         self._run_row_by_account: dict[int, str] = {}
         self._run_status: dict[int, tuple] = {}   # account_id -> (status_text, tag)
@@ -394,11 +396,24 @@ class App(ctk.CTk):
         ctk.CTkButton(acc_btns, text="Remove selected", fg_color=DANGER,
                       hover_color=DANGER_HOV, command=self.on_remove_account).pack(side="left", padx=4)
 
+        login_btns = ctk.CTkFrame(right, fg_color="transparent")
+        login_btns.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 4))
+        self.assist_login_btn = ctk.CTkButton(
+            login_btns, text="Log in selected (auto-fill)", fg_color=BRAND,
+            hover_color=BRAND_HOVER, command=self.on_assist_login,
+        )
+        self.assist_login_btn.pack(side="left", padx=4)
+        self.assist_stop_btn = ctk.CTkButton(
+            login_btns, text="Stop", fg_color=DANGER, hover_color=DANGER_HOV,
+            width=70, state="disabled", command=self.on_assist_stop,
+        )
+        self.assist_stop_btn.pack(side="left", padx=4)
+
         signin_btns = ctk.CTkFrame(right, fg_color="transparent")
-        signin_btns.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 6))
+        signin_btns.grid(row=4, column=0, sticky="ew", padx=6, pady=(0, 6))
         self.open_chrome_btn = ctk.CTkButton(
-            signin_btns, text="Open selected in Chrome (log in)", fg_color=BRAND,
-            hover_color=BRAND_HOVER, command=self.on_open_chrome_login,
+            signin_btns, text="Open selected in Chrome", fg_color=NEUTRAL,
+            hover_color=NEUTRAL_HOV, command=self.on_open_chrome_login,
         )
         self.open_chrome_btn.pack(side="left", padx=4)
         self.refresh_logins_btn = ctk.CTkButton(
@@ -413,7 +428,7 @@ class App(ctk.CTk):
         self.refresh_stop_btn.pack(side="left", padx=4)
 
         signin_btns2 = ctk.CTkFrame(right, fg_color="transparent")
-        signin_btns2.grid(row=5, column=0, sticky="ew", padx=6, pady=(0, 6))
+        signin_btns2.grid(row=6, column=0, sticky="ew", padx=6, pady=(0, 6))
         ctk.CTkButton(
             signin_btns2, text="Mark selected as logged in", fg_color=SUCCESS,
             hover_color=SUCCESS_HOV, command=self.on_mark_logged_in,
@@ -424,11 +439,11 @@ class App(ctk.CTk):
         ).pack(side="left", padx=4)
         ctk.CTkLabel(
             right,
-            text=("Tip: select accounts \u2192 Open in Chrome, log in normally (real browser "
-                  "beats the captcha), close the windows, then Refresh login status. "
-                  "Picks reuse the saved session."),
+            text=("Tip: 'Log in selected (auto-fill)' fills each login for you - clear the "
+                  "captcha + confirm. Or 'Open selected in Chrome' to do it in a normal "
+                  "window. Then picks reuse the saved session."),
             text_color=FG_MUTED, wraplength=460, justify="left", font=ctk.CTkFont(size=11),
-        ).grid(row=4, column=0, sticky="ew", padx=6, pady=(0, 4))
+        ).grid(row=5, column=0, sticky="ew", padx=6, pady=(0, 4))
 
     def on_import(self) -> None:
         text = self.import_box.get("1.0", "end")
@@ -590,6 +605,52 @@ class App(ctk.CTk):
         if self.signin_runner:
             self.signin_runner.cancel()
             self.refresh_stop_btn.configure(state="disabled", text="Stopping...")
+
+    def on_assist_login(self) -> None:
+        """Auto-fill login for selected accounts; you clear the captcha + confirm."""
+        if self.assist_thread and self.assist_thread.is_alive():
+            return
+        ids = self._selected_account_ids()
+        if not ids:
+            messagebox.showinfo("No selection", "Select the accounts to log in.")
+            return
+        try:
+            conc = int(self.su_conc_slider.get())
+        except Exception:  # noqa: BLE001
+            conc = 2
+        try:
+            stagger = float(self.su_stagger_entry.get() or "3")
+        except Exception:  # noqa: BLE001
+            stagger = 3.0
+        proxies = [ln.strip() for ln in self.su_proxy_box.get("1.0", "end").splitlines() if ln.strip()]
+        self.assist_runner = SigninRunner(
+            ids, concurrency=conc, launch_stagger=stagger, proxies=proxies,
+        )
+        self.assist_login_btn.configure(state="disabled", text="Logging in...")
+        self.assist_stop_btn.configure(state="normal", text="Stop")
+        self.accounts_status.configure(
+            text=f"Auto-fill login for {len(ids)} account(s) - clear the captcha + confirm in each window."
+        )
+        self.assist_thread = threading.Thread(target=self._assist_worker, args=(ids,), daemon=True)
+        self.assist_thread.start()
+
+    def _assist_worker(self, ids: list[int]) -> None:
+        cb = SigninCallbacks(
+            on_task_start=lambda aid: self.events.put(("sl_status", aid, "Opening browser...")),
+            on_status=lambda aid, m: self.events.put(("sl_status", aid, m)),
+            on_result=lambda aid, ok, m: self.events.put(("sl_result", aid, ok, m)),
+            on_progress=lambda d, t: self.events.put(("sl_progress", d, t)),
+        )
+        try:
+            self.assist_runner.run(cb)
+            self.events.put(("sl_done",))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("sl_error", str(exc)))
+
+    def on_assist_stop(self) -> None:
+        if self.assist_runner:
+            self.assist_runner.cancel()
+            self.assist_stop_btn.configure(state="disabled", text="Stopping...")
 
     def on_mark_logged_in(self) -> None:
         """Instantly flag selected accounts as logged in (no check)."""
@@ -1843,6 +1904,24 @@ class App(ctk.CTk):
             self.debug_form_btn.configure(state="normal", text="Debug form")
             self.signup_status_lbl.configure(text="Form dump failed.")
             messagebox.showerror("Debug form failed", str(evt[1]))
+        elif kind == "sl_status":
+            acc = self.repo.get_account(evt[1], include_password=False)
+            label = acc.label if acc else f"#{evt[1]}"
+            self.accounts_status.configure(text=f"[{label}] {evt[2]}")
+        elif kind == "sl_result":
+            self.refresh_accounts()
+        elif kind == "sl_progress":
+            self.accounts_status.configure(text=f"Auto-fill login... {evt[1]}/{evt[2]}")
+        elif kind == "sl_done":
+            self.assist_login_btn.configure(state="normal", text="Log in selected (auto-fill)")
+            self.assist_stop_btn.configure(state="disabled", text="Stop")
+            self.refresh_accounts()
+            self.accounts_status.configure(text="Auto-fill login run finished.")
+        elif kind == "sl_error":
+            self.assist_login_btn.configure(state="normal", text="Log in selected (auto-fill)")
+            self.assist_stop_btn.configure(state="disabled", text="Stop")
+            self.refresh_accounts()
+            messagebox.showerror("Login error", str(evt[1]))
         elif kind == "chrome_opened":
             self.accounts_status.configure(
                 text=f"Opened {evt[1]} Chrome window(s). Log in, close them, then "
@@ -1905,6 +1984,8 @@ class App(ctk.CTk):
                 self.signup_runner.cancel()
             if self.signin_runner:
                 self.signin_runner.cancel()
+            if self.assist_runner:
+                self.assist_runner.cancel()
             # Persist the round so nothing is lost on close (cleared only by Reset round).
             self._persist_round()
             self._persist_plan()
