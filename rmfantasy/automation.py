@@ -1284,6 +1284,65 @@ def assist_signup(
     raise SignupError("Timed out waiting for you to confirm the account - not saved.")
 
 
+def _inject_login_overlay(driver, email: str, password: str) -> None:
+    """Panel that SHOWS the login (copyable) so YOU type/paste it -- a fully
+    human login is far less likely to trip the reCAPTCHA than programmatic fill.
+    """
+    payload = json.dumps({"email": email, "pw": password})
+    js = r"""
+    (function(){
+      var old = document.getElementById('__rm_assist'); if (old) old.remove();
+      var cfg = %s;
+      var inp = 'flex:1;background:#0b0d12;color:#fff;border:1px solid #262a36;'
+        + 'border-radius:6px;padding:5px;font-size:12px;min-width:0';
+      var cbtn = 'background:#2f6bff;color:#fff;border:0;border-radius:6px;'
+        + 'padding:0 8px;cursor:pointer;font-size:12px';
+      var d = document.createElement('div'); d.id = '__rm_assist';
+      d.style.cssText = 'position:fixed;top:12px;right:12px;z-index:2147483647;'
+        + 'background:#14161f;color:#f2f4f8;padding:14px 16px;border:2px solid #2f6bff;'
+        + 'border-radius:12px;font-family:Segoe UI,Arial,sans-serif;'
+        + 'box-shadow:0 8px 30px rgba(0,0,0,.55);width:280px';
+      d.innerHTML =
+        '<div style="font-weight:700;margin-bottom:6px">RapidMoto login</div>'
+        + '<div style="font-size:12px;color:#9aa3b2;margin-bottom:8px">'
+        + 'Paste these into the form, click <b>Log In</b> and clear the captcha. '
+        + 'I detect when you are in.</div>'
+        + '<div style="font-size:11px;color:#9aa3b2">Email</div>'
+        + '<div style="display:flex;gap:4px;margin-bottom:6px">'
+        + '<input id="__rm_em" readonly style="'+inp+'">'
+        + '<button id="__rm_cem" style="'+cbtn+'">Copy</button></div>'
+        + '<div style="font-size:11px;color:#9aa3b2">Password</div>'
+        + '<div style="display:flex;gap:4px;margin-bottom:10px">'
+        + '<input id="__rm_pw" readonly style="'+inp+'">'
+        + '<button id="__rm_cpw" style="'+cbtn+'">Copy</button></div>'
+        + '<button id="__rm_ok" style="background:#22c55e;color:#fff;border:0;'
+        + 'padding:9px 12px;border-radius:7px;cursor:pointer;font-weight:700;margin-right:6px">'
+        + 'Logged in \u2713</button>'
+        + '<button id="__rm_skip" style="background:#ef4444;color:#fff;border:0;'
+        + 'padding:9px 12px;border-radius:7px;cursor:pointer;font-weight:700">Skip</button>';
+      document.body.appendChild(d);
+      document.getElementById('__rm_em').value = cfg.email;
+      document.getElementById('__rm_pw').value = cfg.pw;
+      if (typeof window.__rmSignupResult === 'undefined') window.__rmSignupResult = '';
+      function cp(v, b){ try{ navigator.clipboard.writeText(v); b.textContent='Copied'; }catch(e){} }
+      document.getElementById('__rm_cem').onclick = function(){ cp(cfg.email, this); };
+      document.getElementById('__rm_cpw').onclick = function(){ cp(cfg.pw, this); };
+      document.getElementById('__rm_ok').onclick = function(){
+        window.__rmSignupResult='confirmed';
+        d.innerHTML='<div style="font-weight:700">Saving &amp; closing...</div>';
+      };
+      document.getElementById('__rm_skip').onclick = function(){
+        window.__rmSignupResult='skipped';
+        d.innerHTML='<div style="font-weight:700">Skipped.</div>';
+      };
+    })();
+    """ % payload
+    try:
+        driver.execute_script(js)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def assist_login(
     driver,
     email: str,
@@ -1291,14 +1350,15 @@ def assist_login(
     status_cb: Optional[StatusCallback] = None,
     timeout: int = 30,
     wait_timeout: int = 600,
+    autofill: bool = False,
 ) -> None:
-    """Assisted login: fill email+password, you click Log In + clear the captcha.
+    """Assisted login. By default the tool does NOT type your credentials (a
+    purely human login is less likely to trip the reCAPTCHA); it shows them in a
+    copyable panel for you to paste. Set ``autofill=True`` to have it type them.
 
-    The login Submit is a reCAPTCHA button, so a human completes it. We fill the
-    credentials, scroll to the login button, and show the in-page panel. Success
-    is detected automatically (rider dropdowns become editable) OR when you click
-    'Logged in'. Raises :class:`LoginRequired` on skip/close/timeout. The session
-    persists in the Chrome profile so later pick runs reuse it (no re-login).
+    You click Log In + clear the captcha; success is auto-detected (rider
+    dropdowns become editable) or you click 'Logged in'. The session persists in
+    the Chrome profile so later pick runs reuse it (no re-login).
     """
     say = status_cb or (lambda _m: None)
 
@@ -1323,57 +1383,26 @@ def assist_login(
     else:
         _click_by_text(driver, ["LOG IN", "Log In", "Login", "Sign In"])
 
+    # Give the login modal a moment to appear (don't hard-fail; you can open it).
     try:
-        WebDriverWait(driver, timeout).until(
+        WebDriverWait(driver, 12).until(
             EC.visibility_of_element_located((By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS))
         )
-    except TimeoutException as exc:
-        raise LoginRequired(
-            "Login form (email field) did not appear. You can still log in "
-            "manually in the browser window, then click 'Logged in'."
-        ) from exc
+    except TimeoutException:
+        pass
 
-    # Fill credentials (fire events so the form validates / enables the button).
-    try:
-        email_el = driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS)
-        pwd_el = driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_PASSWORD_CSS)
-        _fill_element(driver, email_el, email)
-        _fill_element(driver, pwd_el, password)
-        say("Filled email + password.")
-    except Exception:  # noqa: BLE001
-        say("Could not auto-fill - type your login in the browser, then click 'Logged in'.")
-
-    # Scroll to the login button so it's easy to click.
-    btn = _find_first_visible(driver, [selectors.LOGIN_SUBMIT_CSS])
-    if btn is None:
-        for want in [t.casefold() for t in selectors.LOGIN_SUBMIT_TEXTS]:
-            for tag in ("button", "input", "a"):
-                for e in driver.find_elements(By.TAG_NAME, tag):
-                    try:
-                        raw = e.get_attribute("value") if tag == "input" else e.text
-                        if e.is_displayed() and " ".join((raw or "").split()).casefold() == want:
-                            btn = e
-                            break
-                    except StaleElementReferenceException:
-                        continue
-                if btn:
-                    break
-            if btn:
-                break
-    if btn is not None:
+    # By default DON'T type the credentials (programmatic typing lowers the
+    # captcha score). Only auto-fill if explicitly asked.
+    if autofill:
         try:
-            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+            _fill_element(driver, driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS), email)
+            _fill_element(driver, driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_PASSWORD_CSS), password)
+            say("Filled email + password.")
         except Exception:  # noqa: BLE001
-            pass
+            say("Could not auto-fill - paste the shown login instead.")
 
-    _inject_assist_overlay(
-        driver,
-        title="RapidMoto login",
-        instructions=("1) Click <b>Log In</b> and clear the captcha.<br>"
-                      "2) I detect it automatically, or click below."),
-        ok_label="Logged in",
-    )
-    say("Click Log In in the browser & clear the captcha; I'll detect when you're in.")
+    _inject_login_overlay(driver, email, password)
+    say("Paste the shown login, click Log In & clear the captcha; I detect when you're in.")
 
     deadline = time.time() + wait_timeout
     while time.time() < deadline:
@@ -1399,12 +1428,7 @@ def assist_login(
             raise LoginRequired("Skipped by you.")
         try:
             if not driver.execute_script("return !!document.getElementById('__rm_assist');"):
-                _inject_assist_overlay(
-                    driver, title="RapidMoto login",
-                    instructions=("1) Click <b>Log In</b> and clear the captcha.<br>"
-                                  "2) I detect it automatically, or click below."),
-                    ok_label="Logged in",
-                )
+                _inject_login_overlay(driver, email, password)
         except Exception:  # noqa: BLE001
             pass
         time.sleep(0.6)
