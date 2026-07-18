@@ -1479,6 +1479,13 @@ def _inject_assist_overlay(
         window.__rmSignupResult = 'skipped';
         d.innerHTML = '<div style="font-weight:700">Skipped.</div>';
       };
+      // Keep our panel above late-appearing site popups (e.g. RM Cash) by
+      // re-raising it to the end of <body> so it wins z-index ties.
+      window.__rmKeepTop && clearInterval(window.__rmKeepTop);
+      window.__rmKeepTop = setInterval(function(){
+        var el = document.getElementById('__rm_assist');
+        if (el && document.body.lastElementChild !== el) { document.body.appendChild(el); }
+      }, 500);
     })();
     """ % payload
     try:
@@ -1600,6 +1607,13 @@ def _inject_login_overlay(driver, email: str, password: str) -> None:
         window.__rmSignupResult='skipped';
         d.innerHTML='<div style="font-weight:700">Skipped.</div>';
       };
+      // Keep our panel above late-appearing site popups (e.g. RM Cash) by
+      // re-raising it to the end of <body> so it wins z-index ties.
+      window.__rmKeepTop && clearInterval(window.__rmKeepTop);
+      window.__rmKeepTop = setInterval(function(){
+        var el = document.getElementById('__rm_assist');
+        if (el && document.body.lastElementChild !== el) { document.body.appendChild(el); }
+      }, 500);
     })();
     """ % payload
     try:
