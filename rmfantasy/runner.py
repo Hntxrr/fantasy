@@ -382,11 +382,13 @@ class SignupRunner:
             ) as driver:
                 automation.do_signup(driver, profile, status_cb=status, timeout=self.signup_timeout)
 
-            # Registered + logged in; the profile now holds the session.
-            repo.set_session_valid(account.id, True)
-            status("Registered and saved.")
+            # Registered and saved to Accounts, but left as "not signed in" so
+            # it appears at the BOTTOM of the list until a real login/pick run
+            # confirms the session (per user preference). The Chrome profile
+            # still holds whatever session the signup created.
+            status("Registered - added to Accounts (not signed in).")
             return SignupResult(
-                email, True, "Registered and logged in.",
+                email, True, "Registered - added to Accounts (not signed in).",
                 password=profile.password, account_id=account.id,
             )
         except SignupError as exc:

@@ -594,9 +594,97 @@ def _check_age_radio(driver, label_substrings) -> bool:
 
 
 def _signup_form_present(driver) -> bool:
-    return _find_input_by_placeholder(
-        _signup_scope(driver), selectors.SIGNUP_FIRST_NAME_PLACEHOLDERS
-    ) is not None
+    """True when the registration form is on-screen.
+
+    Distinguishes the signup form from the login modal: signup has a
+    First name / Nickname / Confirm field, OR two visible password inputs
+    (password + confirm) -- login only ever shows one.
+    """
+    scope = _signup_scope(driver)
+    strong = (
+        selectors.SIGNUP_FIRST_NAME_PLACEHOLDERS
+        + selectors.SIGNUP_NICKNAME_PLACEHOLDERS
+        + selectors.SIGNUP_CONFIRM_PLACEHOLDERS
+    )
+    if _find_input_by_placeholder(scope, strong) is not None:
+        return True
+    pwds = [e for e in scope.find_elements(By.CSS_SELECTOR, "input[type='password']") if _is_visible(e)]
+    return len(pwds) >= 2
+
+
+def _visible_click_texts(driver, limit: int = 14) -> list[str]:
+    """Short, visible button/link labels -- used to explain a failed open."""
+    out: list[str] = []
+    for tag in ("button", "a", "input"):
+        for el in driver.find_elements(By.TAG_NAME, tag):
+            try:
+                if not el.is_displayed():
+                    continue
+                raw = el.get_attribute("value") if tag == "input" else el.text
+                t = " ".join((raw or "").split())
+                if t and len(t) <= 44 and t not in out:
+                    out.append(t)
+            except StaleElementReferenceException:
+                continue
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def _signup_open_candidates(driver) -> list:
+    """Visible elements that look like a 'Sign Up' trigger (shortest first)."""
+    subs = [s.casefold() for s in selectors.SIGNUP_OPEN_TEXTS] + [
+        "sign up", "signup", "register", "create account", "new player",
+    ]
+    exclude = ("log in", "login", "existing account", "sign in")
+    cands: list[tuple[int, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for tag in ("button", "a", "input", "span", "div", "li"):
+        for el in driver.find_elements(By.TAG_NAME, tag):
+            try:
+                if not el.is_displayed():
+                    continue
+                raw = el.get_attribute("value") if tag == "input" else el.text
+                t = " ".join((raw or "").split())
+                low = t.casefold()
+                if not low or len(low) > 44:
+                    continue
+                if any(x in low for x in exclude):
+                    continue
+                if any(s in low for s in subs):
+                    key = (tag, t)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    cands.append((len(low), el))
+            except StaleElementReferenceException:
+                continue
+    cands.sort(key=lambda pair: pair[0])
+    return [el for _, el in cands]
+
+
+def _open_signup_modal(driver, timeout: int = 30) -> bool:
+    """Click a 'Sign Up' trigger and wait for the registration form.
+
+    Tries each candidate (shortest label first), giving the modal a moment to
+    render after each click. Returns True once the form is present.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _signup_form_present(driver):
+            return True
+        for el in _signup_open_candidates(driver):
+            try:
+                _click(driver, el)
+            except Exception:  # noqa: BLE001
+                continue
+            try:
+                WebDriverWait(driver, 4).until(_signup_form_present)
+                return True
+            except TimeoutException:
+                continue
+        time.sleep(0.5)
+    return _signup_form_present(driver)
 
 
 def _confirm_signup(driver, timeout: int = 30) -> bool:
@@ -643,18 +731,19 @@ def do_signup(
 
     driver.get(config.BASE_URL)
     WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    # Let the (JS-rendered) header/buttons settle before we hunt for Sign Up.
+    time.sleep(1.0)
 
     # Open the "new player -> SIGN UP" modal (unless it's already showing).
     say("Opening sign-up form...")
-    if not _signup_form_present(driver):
-        _click_by_text(driver, selectors.SIGNUP_OPEN_TEXTS)
-    try:
-        WebDriverWait(driver, timeout).until(_signup_form_present)
-    except TimeoutException as exc:
+    if not _open_signup_modal(driver, timeout=timeout):
+        seen = _visible_click_texts(driver)
+        hint = (", ".join(seen) if seen else "(no buttons detected)")
         raise SignupError(
-            "Sign-up form did not appear. Check SIGNUP_OPEN_TEXTS / "
-            "SIGNUP_FIRST_NAME_PLACEHOLDERS in selectors.py."
-        ) from exc
+            "Could not open the sign-up form. The buttons/links I could see were: "
+            f"[{hint}]. Tell me which one opens sign-up (or share this) so the "
+            "SIGNUP_OPEN_TEXTS in selectors.py can be set exactly."
+        )
 
     scope = _signup_scope(driver)
     say("Filling registration form...")

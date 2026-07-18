@@ -34,7 +34,10 @@ LOGIN_ERROR_CSS = "#loginModal .error, #loginModal .alert-danger, #loginModal .p
 # button. As with login, we NEVER target Wicket ids: fields are located by
 # their (stable, human-readable) placeholder text, associated <label> text, or
 # input type. Adjust the strings below if the site wording changes.
-SIGNUP_OPEN_TEXTS = ["SIGN UP", "Sign Up", "Signup", "Register", "Create Account"]
+SIGNUP_OPEN_TEXTS = [
+    "SIGN UP", "Sign Up", "Signup", "Sign up", "Register", "Create Account",
+    "Are you a new player? SIGN UP", "New player", "new player",
+]
 # The signup modal, if it has a stable-ish container. We still fall back to
 # "any visible form containing a First Name field" when this isn't found.
 SIGNUP_MODAL_CSS = "#signupModal, #registerModal, #signUpModal, .signupModal"
