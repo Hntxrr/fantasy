@@ -146,6 +146,12 @@ class Repository:
     def count_accounts(self) -> int:
         return self.conn.execute("SELECT COUNT(*) AS c FROM accounts").fetchone()["c"]
 
+    def email_exists(self, email: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM accounts WHERE email = ? COLLATE NOCASE", (email.strip(),)
+        ).fetchone()
+        return row is not None
+
     def clear_all_accounts(self) -> int:
         """Delete every account (and cascaded assignments/rotation state).
 

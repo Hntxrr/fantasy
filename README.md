@@ -17,6 +17,11 @@ tooling required.
   time) into SQLite. Each account gets an **isolated Chrome profile**
   (`--user-data-dir`) so cookies/sessions never collide. Sessions persist, so
   after the first login the bot detects *"already logged in"* and skips login.
+- **Bulk sign-up** — paste a list of emails + one shared mailing address; the
+  bot fabricates a random name, phone, nickname and strong password for each,
+  ticks *"I am 18 or older"*, submits the registration, then saves the new
+  `email:password` to `signups.txt` and drops the account straight into
+  **Accounts** already logged in.
 - **Fuzzy rider-name resolution** — you type partials/first names/typos; the app
   scrapes the site's rider dropdown once and resolves them:
   `Jett → Jett Lawrence`, `Jordan smith → Jordon Smith`,
@@ -70,10 +75,31 @@ it can't be cross-compiled from Linux/macOS.)
 
 ---
 
+## Creating accounts (Sign Up tab)
+
+Need fresh accounts? On the **Sign Up** tab:
+
+1. Paste the **emails** you want to register (one per line).
+2. Fill the **shared mailing address** — Street, City, **State** (dropdown),
+   Postal code. **Country** defaults to *United States*.
+3. Set options (keep **Concurrent browsers** low — 1–2 — with a 6–10s stagger
+   from a single IP), then click **SIGN UP ALL**.
+
+For each email the bot generates a random first/last name, phone, nickname and
+a strong password, ticks *"I am 18 or older"*, and submits the form. On success
+the `email:password` is appended to `signups.txt` (see *Where data lives*) and
+the account appears in **Accounts** already logged in. Emails that already exist
+as accounts are skipped; a signup that fails is rolled back (no orphan account).
+
+> The registration form is located by field **placeholder/label text** (not the
+> site's volatile Wicket ids). If the site changes its wording, tweak the
+> `SIGNUP_*` entries in `rmfantasy/selectors.py`.
+
 ## Weekly workflow
 
 1. **Accounts tab** — paste `email:password` lines → **Import accounts**.
-   (Use **Clear ALL accounts** to wipe and re-import.)
+   (Use **Clear ALL accounts** to wipe and re-import.) New here? Use the
+   **Sign Up** tab (above) to create accounts first.
 2. **This Round tab**
    - Paste **lineups**, one per line, 5 space-separated names
      (`Jett Hunter Haiden Eli Jorge`).
@@ -159,10 +185,15 @@ A single per-user app directory (override with `RMFANTASY_HOME`):
 
 ```
 rmfantasy.db            SQLite: accounts, lineups, roster, submission log, state
+signups.txt             email:password lines for accounts created via Sign Up
 secret.key              Fernet key (only if OS keyring is unavailable; chmod 600)
 chrome_profiles/<slug>/ one isolated Chrome profile per account
 logs/app.log            rolling log
 ```
+
+> On Windows, paste `%APPDATA%\RMFantasySMX` into the File Explorer address bar
+> to open this folder. `signups.txt` is a plaintext convenience export of the
+> accounts you create on the **Sign Up** tab.
 
 **Credentials:** passwords are encrypted at rest with Fernet; the key is stored
 in your OS keyring (Windows Credential Manager / macOS Keychain / Secret
@@ -189,6 +220,11 @@ and content heuristics:
   name (`select_by_visible_text`), which correctly picks the first of the two
   listings (featured + alphabetical).
 - **Submit** — a button found by text (`Submit Your Picks`, etc.).
+- **Sign up** — the registration modal is opened by the *new player* **SIGN UP**
+  button; fields are located by **placeholder text** (`First Name`, `Email`,
+  …), the Country/State `<select>`s by their **option contents** (the one with
+  a `United States` option; the one listing US states), and the **18+** radio by
+  its label text. Success = logged in / form closed / a welcome message.
 - **AJAX-safe** — explicit `WebDriverWait` throughout; a custom `wait_until_any`
   is used instead of the unreliable `EC.or_`.
 
@@ -201,6 +237,9 @@ confirmation detected":
 - `SUBMIT_PICKS_BUTTON_TEXTS` — exact submit button label.
 - `SUBMIT_SUCCESS_TEXT_CONTAINS` / `SUBMIT_SUCCESS_CSS` — how the site confirms
   a successful submission (a timestamp element or success banner).
+- `SIGNUP_*` — the registration field placeholders, the open-signup button
+  text, the 18+ label text, and the submit label. Verify these on your first
+  live sign-up; they're best-effort guesses from the form layout.
 
 ---
 
@@ -215,9 +254,10 @@ rmfantasy/
   repository.py    all data access (accounts, lineups, roster, log, meta)
   resolver.py      fuzzy rider-name resolution
   assignment.py    cartesian lineup × wildcard → account plan (with start_offset)
+  signup.py        random identity generator + signup models + US states
   selectors.py     ALL web selectors (edit here if the site changes)
-  automation.py    Selenium: driver, login, scrape, select, submit
-  runner.py        ConcurrentRunner (thread pool, stagger, proxies, retries)
+  automation.py    Selenium: driver, login, scrape, select, submit, sign up
+  runner.py        ConcurrentRunner + SignupRunner (thread pool, stagger, proxies)
   rotation.py      optional per-account wildcard rotation (not used by the
                    cartesian workflow; kept for round-to-round cycling)
   ui/app.py        CustomTkinter app (4 tabs) + thread-safe queue bridge

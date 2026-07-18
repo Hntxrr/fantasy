@@ -39,6 +39,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
 
 from . import config, selectors
+from .signup import SignupProfile, state_variants
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +74,10 @@ class EligibilityError(AutomationError):
 
 class SubmissionError(AutomationError):
     """Raised when picks could not be submitted or confirmed."""
+
+
+class SignupError(AutomationError):
+    """Raised when a new account could not be registered/confirmed."""
 
 
 @dataclass
@@ -468,3 +473,248 @@ def submit_picks(
             "Submitted but no confirmation detected. Verify SUBMIT_SUCCESS_* "
             "selectors in selectors.py or check the site."
         )
+
+
+
+# --------------------------------------------------------------------------- #
+# Sign up / registration
+# --------------------------------------------------------------------------- #
+def _is_visible(el) -> bool:
+    try:
+        return el.is_displayed()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _signup_scope(driver):
+    """Return the signup modal element if visible, else the whole driver."""
+    el = _find_first_visible(driver, [selectors.SIGNUP_MODAL_CSS])
+    return el or driver
+
+
+def _find_input_by_placeholder(scope, placeholder_substrings):
+    """First visible <input>/<textarea> whose placeholder contains any substring."""
+    subs = [s.casefold() for s in placeholder_substrings]
+    for el in scope.find_elements(By.CSS_SELECTOR, "input, textarea"):
+        if not _is_visible(el):
+            continue
+        ph = (el.get_attribute("placeholder") or "").casefold()
+        if ph and any(s in ph for s in subs):
+            return el
+    return None
+
+
+def _fill_element(el, value: str) -> None:
+    try:
+        el.clear()
+    except Exception:  # noqa: BLE001
+        pass
+    el.send_keys(value)
+
+
+def _fill_placeholder_field(scope, placeholders, value, field_name, required=True) -> bool:
+    el = _find_input_by_placeholder(scope, placeholders)
+    if el is None:
+        if required:
+            raise SignupError(f"Could not find the '{field_name}' field on the sign-up form.")
+        return False
+    _fill_element(el, value)
+    return True
+
+
+def _visible_selects(scope):
+    return [s for s in scope.find_elements(By.TAG_NAME, "select") if _is_visible(s)]
+
+
+def _select_has_option(select_el, needles) -> bool:
+    ns = [n.casefold() for n in needles]
+    try:
+        for opt in select_el.find_elements(By.TAG_NAME, "option"):
+            t = (opt.text or "").strip().casefold()
+            if t and any(n == t or n in t for n in ns):
+                return True
+    except StaleElementReferenceException:
+        return False
+    return False
+
+
+def _find_select_with_option(scope, needles):
+    for s in _visible_selects(scope):
+        if _select_has_option(s, needles):
+            return s
+    return None
+
+
+def _select_option_tolerant(select_el, wanted_variants) -> bool:
+    """Select the first option matching any variant (exact, then contains)."""
+    sel = Select(select_el)
+    options = sel.options
+    for variant in wanted_variants:
+        v = variant.casefold()
+        for o in options:
+            if (o.text or "").strip().casefold() == v:
+                sel.select_by_visible_text(o.text)
+                return True
+    for variant in wanted_variants:
+        v = variant.casefold()
+        for o in options:
+            if v and v in (o.text or "").strip().casefold():
+                sel.select_by_visible_text(o.text)
+                return True
+    return False
+
+
+def _check_age_radio(driver, label_substrings) -> bool:
+    """Tick the '18 years or older' radio, located via its label text."""
+    for phrase in label_substrings:
+        p = phrase.lower()
+        xp = (
+            "//label[contains(translate(., "
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), "
+            f"'{p}')]"
+        )
+        for lbl in driver.find_elements(By.XPATH, xp):
+            if not _is_visible(lbl):
+                continue
+            fid = lbl.get_attribute("for")
+            if fid:
+                els = driver.find_elements(By.ID, fid)
+                if els:
+                    _click(driver, els[0])
+                    return True
+            inside = lbl.find_elements(By.CSS_SELECTOR, "input[type='radio']")
+            if inside:
+                _click(driver, inside[0])
+                return True
+            near = lbl.find_elements(By.XPATH, "preceding::input[@type='radio'][1]")
+            if near:
+                _click(driver, near[0])
+                return True
+    return False
+
+
+def _signup_form_present(driver) -> bool:
+    return _find_input_by_placeholder(
+        _signup_scope(driver), selectors.SIGNUP_FIRST_NAME_PLACEHOLDERS
+    ) is not None
+
+
+def _confirm_signup(driver, timeout: int = 30) -> bool:
+    """Success == logged in, OR a success message, OR the form disappeared."""
+    success_texts = [t.casefold() for t in selectors.SIGNUP_SUCCESS_TEXT_CONTAINS]
+
+    def _has_success(d) -> bool:
+        try:
+            body = d.find_element(By.TAG_NAME, "body").text.casefold()
+        except Exception:  # noqa: BLE001
+            return False
+        return any(t in body for t in success_texts)
+
+    try:
+        wait_until_any(
+            driver,
+            [
+                lambda d: is_logged_in(d),
+                _has_success,
+                lambda d: not _signup_form_present(d),
+            ],
+            timeout=timeout,
+        )
+        return True
+    except TimeoutException:
+        return False
+
+
+def do_signup(
+    driver,
+    profile: SignupProfile,
+    status_cb: Optional[StatusCallback] = None,
+    timeout: int = 30,
+) -> None:
+    """Register a brand-new account from a :class:`SignupProfile`.
+
+    Opens the registration modal, fills every field (random identity + shared
+    address, country defaulting to the United States), ticks "I am 18 or
+    older", and submits. Raises :class:`SignupError` if the form can't be found
+    or the registration isn't confirmed. The browser profile is persisted by
+    the caller so the freshly-created session stays logged in.
+    """
+    say = status_cb or (lambda _m: None)
+
+    driver.get(config.BASE_URL)
+    WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+    # Open the "new player -> SIGN UP" modal (unless it's already showing).
+    say("Opening sign-up form...")
+    if not _signup_form_present(driver):
+        _click_by_text(driver, selectors.SIGNUP_OPEN_TEXTS)
+    try:
+        WebDriverWait(driver, timeout).until(_signup_form_present)
+    except TimeoutException as exc:
+        raise SignupError(
+            "Sign-up form did not appear. Check SIGNUP_OPEN_TEXTS / "
+            "SIGNUP_FIRST_NAME_PLACEHOLDERS in selectors.py."
+        ) from exc
+
+    scope = _signup_scope(driver)
+    say("Filling registration form...")
+    _fill_placeholder_field(scope, selectors.SIGNUP_FIRST_NAME_PLACEHOLDERS, profile.first_name, "first name")
+    _fill_placeholder_field(scope, selectors.SIGNUP_LAST_NAME_PLACEHOLDERS, profile.last_name, "last name")
+    _fill_placeholder_field(scope, selectors.SIGNUP_EMAIL_PLACEHOLDERS, profile.email, "email")
+    _fill_placeholder_field(scope, selectors.SIGNUP_PHONE_PLACEHOLDERS, profile.phone, "phone", required=False)
+
+    # Mailing address (shared across the batch; only fill what was provided).
+    if profile.street:
+        _fill_placeholder_field(scope, selectors.SIGNUP_STREET_PLACEHOLDERS, profile.street, "street", required=False)
+    if profile.city:
+        _fill_placeholder_field(scope, selectors.SIGNUP_CITY_PLACEHOLDERS, profile.city, "city", required=False)
+    if profile.postal_code:
+        _fill_placeholder_field(scope, selectors.SIGNUP_POSTAL_PLACEHOLDERS, profile.postal_code, "postal code", required=False)
+    _fill_placeholder_field(scope, selectors.SIGNUP_NICKNAME_PLACEHOLDERS, profile.nickname, "nickname", required=False)
+
+    # Country (defaults to United States) + State selects, found by their
+    # option contents so we don't depend on Wicket ids or label order.
+    country_sel = _find_select_with_option(scope, [selectors.SIGNUP_DEFAULT_COUNTRY, "united states", "usa"])
+    if country_sel is not None:
+        _select_option_tolerant(country_sel, [profile.country, selectors.SIGNUP_DEFAULT_COUNTRY, "USA"])
+    if profile.state:
+        state_sel = _find_select_with_option(
+            scope, ["alabama", "california", "new york", "texas", "wyoming", "florida"]
+        )
+        if state_sel is not None:
+            if not _select_option_tolerant(state_sel, state_variants(profile.state)):
+                say(f"Could not match state '{profile.state}' in the dropdown - left as-is.")
+
+    # Password + confirm (first two visible password inputs in the form).
+    pwd_inputs = [e for e in scope.find_elements(By.CSS_SELECTOR, "input[type='password']") if _is_visible(e)]
+    if not pwd_inputs:
+        raise SignupError("Could not find the password field on the sign-up form.")
+    _fill_element(pwd_inputs[0], profile.password)
+    if len(pwd_inputs) >= 2:
+        _fill_element(pwd_inputs[1], profile.password)
+    else:
+        confirm = _find_input_by_placeholder(scope, selectors.SIGNUP_CONFIRM_PLACEHOLDERS)
+        if confirm is not None:
+            _fill_element(confirm, profile.password)
+
+    # "I am 18 years or older" eligibility radio (required to submit).
+    say("Confirming 18+...")
+    if not _check_age_radio(driver, selectors.SIGNUP_AGE_OK_LABEL_CONTAINS):
+        say("Warning: could not find the '18 or older' option - check SIGNUP_AGE_OK_LABEL_CONTAINS.")
+
+    # Submit.
+    say("Submitting registration...")
+    submit = _find_first_visible(driver, [selectors.SIGNUP_SUBMIT_CSS])
+    if submit is not None:
+        _click(driver, submit)
+    elif not _click_by_text(driver, selectors.SIGNUP_SUBMIT_TEXTS):
+        raise SignupError(
+            "Could not find the registration Submit button. Check "
+            "SIGNUP_SUBMIT_TEXTS / SIGNUP_SUBMIT_CSS in selectors.py."
+        )
+
+    say("Confirming registration...")
+    if not _confirm_signup(driver, timeout=timeout):
+        err = _find_first_visible(driver, [selectors.SIGNUP_ERROR_CSS])
+        detail = f" Site said: {err.text.strip()}" if err and err.text.strip() else ""
+        raise SignupError(f"Registration submitted but not confirmed.{detail}")

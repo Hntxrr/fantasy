@@ -19,6 +19,7 @@ connection (connections are not shareable across threads).
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import sys
 import threading
@@ -39,7 +40,16 @@ from .. import automation, config
 from ..assignment import AssignmentPlan, RoundAssignment, build_plan
 from ..repository import Repository
 from ..resolver import RiderResolver
-from ..runner import ConcurrentRunner, RunCallbacks, RunResult
+from ..runner import (
+    ConcurrentRunner,
+    RunCallbacks,
+    RunResult,
+    SignupCallbacks,
+    SignupRunner,
+)
+from ..signup import US_STATE_NAMES, SignupResult
+
+log = logging.getLogger(__name__)
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -184,7 +194,10 @@ class App(ctk.CTk):
         self.events: queue.Queue = queue.Queue()
         self.run_thread: threading.Thread | None = None
         self.scrape_thread: threading.Thread | None = None
+        self.signup_thread: threading.Thread | None = None
         self.runner: ConcurrentRunner | None = None
+        self.signup_runner: SignupRunner | None = None
+        self._su_row_by_email: dict[str, str] = {}
         self._run_row_by_account: dict[int, str] = {}
         self._run_status: dict[int, tuple] = {}   # account_id -> (status_text, tag)
         self._watch_threads: list = []
@@ -203,11 +216,13 @@ class App(ctk.CTk):
         )
         self.tabs.pack(fill="both", expand=True, padx=PAD, pady=(0, PAD))
         self.tabs.add("Accounts")
+        self.tabs.add("Sign Up")
         self.tabs.add("This Round")
         self.tabs.add("Run Picks")
         self.tabs.add("History")
 
         self._build_accounts_tab(self.tabs.tab("Accounts"))
+        self._build_signup_tab(self.tabs.tab("Sign Up"))
         self._build_round_tab(self.tabs.tab("This Round"))
         self._build_run_tab(self.tabs.tab("Run Picks"))
         self._build_history_tab(self.tabs.tab("History"))
@@ -428,6 +443,251 @@ class App(ctk.CTk):
             return
         acc = self.repo.get_account(acc_id, include_password=False)
         EditAccountDialog(self, acc_id, acc.label, acc.email)
+
+    # ================================================================== #
+    # Sign Up tab
+    # ================================================================== #
+    def _build_signup_tab(self, tab) -> None:
+        tab.grid_columnconfigure(0, weight=3)
+        tab.grid_columnconfigure(1, weight=2)
+        tab.grid_rowconfigure(1, weight=1)
+
+        # --- Left: emails to register ------------------------------------ #
+        ctk.CTkLabel(
+            tab, text="Emails to sign up  (one per line)",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=PAD, pady=(PAD, 0))
+        self.signup_emails_box = ctk.CTkTextbox(tab, fg_color=SURFACE_2)
+        self.signup_emails_box.grid(row=1, column=0, sticky="nsew", padx=PAD, pady=PAD)
+        self.signup_emails_box.insert("1.0", "# one email per line\n")
+
+        # --- Right: shared mailing address ------------------------------- #
+        addr = ctk.CTkFrame(tab, fg_color=SURFACE_2, corner_radius=12)
+        addr.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=PAD, pady=(PAD, PAD))
+        addr.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            addr, text="Mailing address  (shared by all)",
+            font=ctk.CTkFont(size=13, weight="bold"), text_color=FG,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(12, 6))
+
+        ctk.CTkLabel(addr, text="Street:", text_color=FG_MUTED).grid(row=1, column=0, sticky="w", padx=(14, 6), pady=5)
+        self.su_street = ctk.CTkEntry(addr, fg_color=SURFACE, border_color=BORDER)
+        self.su_street.grid(row=1, column=1, sticky="ew", padx=(0, 14), pady=5)
+
+        ctk.CTkLabel(addr, text="City:", text_color=FG_MUTED).grid(row=2, column=0, sticky="w", padx=(14, 6), pady=5)
+        self.su_city = ctk.CTkEntry(addr, fg_color=SURFACE, border_color=BORDER)
+        self.su_city.grid(row=2, column=1, sticky="ew", padx=(0, 14), pady=5)
+
+        ctk.CTkLabel(addr, text="State:", text_color=FG_MUTED).grid(row=3, column=0, sticky="w", padx=(14, 6), pady=5)
+        self.su_state = SearchableComboBox(
+            addr, values=list(US_STATE_NAMES),
+            fg_color=SURFACE, button_color=BRAND, button_hover_color=BRAND_HOVER,
+            border_color=BORDER, dropdown_fg_color=SURFACE,
+            dropdown_hover_color=HOVER, dropdown_text_color=FG,
+        )
+        self.su_state.set("")
+        self.su_state.grid(row=3, column=1, sticky="ew", padx=(0, 14), pady=5)
+
+        ctk.CTkLabel(addr, text="Postal code:", text_color=FG_MUTED).grid(row=4, column=0, sticky="w", padx=(14, 6), pady=5)
+        self.su_postal = ctk.CTkEntry(addr, fg_color=SURFACE, border_color=BORDER)
+        self.su_postal.grid(row=4, column=1, sticky="ew", padx=(0, 14), pady=5)
+
+        ctk.CTkLabel(addr, text="Country:", text_color=FG_MUTED).grid(row=5, column=0, sticky="w", padx=(14, 6), pady=5)
+        self.su_country = ctk.CTkEntry(addr, fg_color=SURFACE, border_color=BORDER)
+        self.su_country.insert(0, "United States")
+        self.su_country.grid(row=5, column=1, sticky="ew", padx=(0, 14), pady=5)
+
+        ctk.CTkLabel(
+            addr,
+            text=("First/last name, phone, nickname and password are generated "
+                  "randomly for each email, and \u201cI am 18 or older\u201d is "
+                  "ticked automatically."),
+            text_color=FG_MUTED, wraplength=300, justify="left",
+        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=14, pady=(8, 12))
+
+        # --- Options ----------------------------------------------------- #
+        opts = ctk.CTkFrame(tab, fg_color=SURFACE)
+        opts.grid(row=2, column=0, columnspan=2, sticky="ew", padx=PAD, pady=(0, PAD))
+        opts.grid_columnconfigure(7, weight=1)
+
+        ctk.CTkLabel(opts, text="Concurrent browsers:").grid(row=0, column=0, padx=(8, 4), pady=8)
+        self.su_conc_value = ctk.CTkLabel(opts, text="1", width=28)
+        self.su_conc_slider = ctk.CTkSlider(
+            opts, from_=1, to=8, number_of_steps=7, width=130,
+            command=lambda v: self.su_conc_value.configure(text=str(int(v))),
+        )
+        self.su_conc_slider.set(1)
+        self.su_conc_slider.grid(row=0, column=1, padx=4)
+        self.su_conc_value.grid(row=0, column=2, padx=(0, 12))
+
+        ctk.CTkLabel(opts, text="Launch stagger (s):").grid(row=0, column=3, padx=(8, 4))
+        self.su_stagger_entry = ctk.CTkEntry(opts, width=54)
+        self.su_stagger_entry.insert(0, "6")
+        self.su_stagger_entry.grid(row=0, column=4, padx=4)
+
+        self.su_headless_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(opts, text="Headless", variable=self.su_headless_var
+                        ).grid(row=0, column=5, padx=12)
+
+        ctk.CTkLabel(opts, text="Proxies (one host:port per line, optional; round-robin):"
+                     ).grid(row=1, column=0, columnspan=8, sticky="w", padx=8, pady=(4, 0))
+        self.su_proxy_box = ctk.CTkTextbox(opts, height=44, fg_color=SURFACE_2)
+        self.su_proxy_box.grid(row=2, column=0, columnspan=8, sticky="ew", padx=8, pady=(0, 8))
+
+        ctk.CTkLabel(
+            opts,
+            text=("Go gentle from one IP: 1-2 concurrent with a 6-10s stagger. "
+                  "New account submissions from the same IP are exactly what "
+                  "trips rate limits, so slower is safer here."),
+            text_color=FG_MUTED, wraplength=1040, justify="left",
+        ).grid(row=3, column=0, columnspan=8, sticky="w", padx=8, pady=(0, 8))
+
+        # --- Actions ----------------------------------------------------- #
+        actions = ctk.CTkFrame(tab, fg_color="transparent")
+        actions.grid(row=3, column=0, columnspan=2, sticky="ew", padx=PAD)
+        self.signup_btn = ctk.CTkButton(
+            actions, text="SIGN UP ALL", fg_color=SUCCESS, hover_color=SUCCESS_HOV,
+            height=40, width=140, font=ctk.CTkFont(size=15, weight="bold"),
+            command=self.on_signup_run,
+        )
+        self.signup_btn.pack(side="left", padx=4)
+        self.signup_stop_btn = ctk.CTkButton(
+            actions, text="STOP", fg_color=DANGER, hover_color=DANGER_HOV,
+            height=40, width=80, state="disabled", command=self.on_signup_stop,
+        )
+        self.signup_stop_btn.pack(side="left", padx=4)
+        self.signup_progress = ctk.CTkProgressBar(actions, width=220)
+        self.signup_progress.set(0)
+        self.signup_progress.pack(side="left", padx=12)
+        self.signup_progress_lbl = ctk.CTkLabel(actions, text="0 / 0")
+        self.signup_progress_lbl.pack(side="left")
+
+        self.signup_status_lbl = ctk.CTkLabel(
+            tab, text=f"Saved logins are written to: {config.SIGNUPS_PATH}",
+            anchor="w", text_color=FG_MUTED,
+        )
+        self.signup_status_lbl.grid(row=4, column=0, columnspan=2, sticky="ew", padx=PAD, pady=(6, 0))
+
+        # --- Results table ----------------------------------------------- #
+        wrap = tk.Frame(tab, bg=SURFACE_2)
+        wrap.grid(row=5, column=0, columnspan=2, sticky="nsew", padx=PAD, pady=PAD)
+        tab.grid_rowconfigure(5, weight=1)
+        wrap.grid_rowconfigure(0, weight=1)
+        wrap.grid_columnconfigure(0, weight=1)
+        cols = ("email", "status")
+        self.signup_tree = ttk.Treeview(wrap, columns=cols, show="headings")
+        self.signup_tree.heading("email", text="Email")
+        self.signup_tree.heading("status", text="Status")
+        self.signup_tree.column("email", width=300, anchor="w")
+        self.signup_tree.column("status", width=560, anchor="w")
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.signup_tree.yview)
+        self.signup_tree.configure(yscrollcommand=vsb.set)
+        self.signup_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        self.signup_tree.tag_configure("ok", foreground=ROW_OK)
+        self.signup_tree.tag_configure("fail", foreground=ROW_FAIL)
+        self.signup_tree.tag_configure("busy", foreground=ROW_BUSY)
+        self.signup_tree.tag_configure("skip", foreground=ROW_SKIP)
+
+    def _parse_signup_emails(self) -> list[str]:
+        """Emails from the box: strip, drop blanks/#comments, dedupe, need '@'."""
+        out, seen = [], set()
+        for raw in self.signup_emails_box.get("1.0", "end").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            key = line.casefold()
+            if "@" not in line or key in seen:
+                continue
+            seen.add(key)
+            out.append(line)
+        return out
+
+    def _su_update_row(self, email: str, status: str, tag: str) -> None:
+        iid = self._su_row_by_email.get(email)
+        if iid and self.signup_tree.exists(iid):
+            self.signup_tree.set(iid, "status", status)
+            self.signup_tree.item(iid, tags=(tag,) if tag else ())
+
+    def on_signup_run(self) -> None:
+        if self.signup_thread and self.signup_thread.is_alive():
+            return
+        emails = self._parse_signup_emails()
+        if not emails:
+            messagebox.showwarning("No emails", "Paste at least one email (one per line).")
+            return
+        state = self.su_state.get().strip()
+        if not state and not messagebox.askyesno(
+            "No state selected",
+            "No state is selected. The site usually requires one and the "
+            "signups may fail.\n\nContinue anyway?",
+        ):
+            return
+
+        # Populate the results table.
+        for iid in self.signup_tree.get_children():
+            self.signup_tree.delete(iid)
+        self._su_row_by_email.clear()
+        for email in emails:
+            iid = f"su::{email}"
+            self._su_row_by_email[email] = iid
+            self.signup_tree.insert("", "end", iid=iid, values=(email, "Pending"), tags=())
+
+        try:
+            stagger = float(self.su_stagger_entry.get() or "6")
+        except ValueError:
+            stagger = 6.0
+        proxies = [ln.strip() for ln in self.su_proxy_box.get("1.0", "end").splitlines() if ln.strip()]
+
+        self.signup_runner = SignupRunner(
+            street=self.su_street.get().strip(),
+            city=self.su_city.get().strip(),
+            state=state,
+            postal_code=self.su_postal.get().strip(),
+            country=self.su_country.get().strip() or "United States",
+            concurrency=int(self.su_conc_slider.get()),
+            headless=self.su_headless_var.get(),
+            launch_stagger=stagger,
+            proxies=proxies,
+        )
+        self.signup_progress.set(0)
+        self.signup_progress_lbl.configure(text=f"0 / {len(emails)}")
+        self._set_signup_running(True)
+        self.signup_thread = threading.Thread(
+            target=self._signup_worker, args=(emails,), daemon=True
+        )
+        self.signup_thread.start()
+
+    def _signup_worker(self, emails: list[str]) -> None:
+        cb = SignupCallbacks(
+            on_task_start=lambda e: self.events.put(("su_task_start", e)),
+            on_status=lambda e, m: self.events.put(("su_status", e, m)),
+            on_result=lambda r: self.events.put(("su_result", r)),
+            on_progress=lambda d, t: self.events.put(("su_progress", d, t)),
+        )
+        try:
+            self.signup_runner.run(emails, cb)
+            self.events.put(("su_run_done",))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("su_run_error", str(exc)))
+
+    def on_signup_stop(self) -> None:
+        if self.signup_runner:
+            self.signup_runner.cancel()
+            self.signup_stop_btn.configure(state="disabled", text="Stopping...")
+
+    def _set_signup_running(self, running: bool) -> None:
+        self.signup_btn.configure(state="disabled" if running else "normal")
+        self.signup_stop_btn.configure(state="normal" if running else "disabled", text="STOP")
+
+    def _append_signup_file(self, email: str, password: str) -> None:
+        """Append one email:password line to the signups export (main thread)."""
+        try:
+            config.ensure_dirs()
+            with open(config.SIGNUPS_PATH, "a", encoding="utf-8") as fh:
+                fh.write(f"{email}:{password}\n")
+        except Exception:  # noqa: BLE001
+            log.exception("Could not write to signups file")
 
     # ================================================================== #
     # This Round tab
@@ -1268,6 +1528,26 @@ class App(ctk.CTk):
         elif kind == "run_error":
             self._on_run_finished()
             messagebox.showerror("Run error", evt[1])
+        elif kind == "su_task_start":
+            self._su_update_row(evt[1], "Starting...", "busy")
+        elif kind == "su_status":
+            self._su_update_row(evt[1], evt[2], "busy")
+        elif kind == "su_result":
+            r: SignupResult = evt[1]
+            tag = "ok" if r.success else ("skip" if "skipped" in r.message.lower() else "fail")
+            self._su_update_row(r.email, r.message, tag)
+            if r.success and r.password:
+                self._append_signup_file(r.email, r.password)
+                self.refresh_accounts()
+        elif kind == "su_progress":
+            done, total = evt[1], evt[2]
+            self.signup_progress.set(done / total if total else 0)
+            self.signup_progress_lbl.configure(text=f"{done} / {total}")
+        elif kind == "su_run_done":
+            self._on_signup_finished()
+        elif kind == "su_run_error":
+            self._on_signup_finished()
+            messagebox.showerror("Sign-up error", evt[1])
 
     def _update_run_row(self, account_id: int, status: str, tag: str, remember: bool = True):
         iid = self._run_row_by_account.get(account_id)
@@ -1285,6 +1565,17 @@ class App(ctk.CTk):
         self.refresh_accounts()
         self.refresh_history()
 
+    def _on_signup_finished(self):
+        self._set_signup_running(False)
+        self.refresh_accounts()
+        n = sum(
+            1 for iid in self.signup_tree.get_children()
+            if "ok" in (self.signup_tree.item(iid, "tags") or ())
+        )
+        self.signup_status_lbl.configure(
+            text=f"Done. {n} new account(s) saved to {config.SIGNUPS_PATH}"
+        )
+
     def _on_close(self):
         try:
             # Stop the event pump so no pending timer fires after destroy().
@@ -1295,6 +1586,8 @@ class App(ctk.CTk):
                     pass
             if self.runner:
                 self.runner.cancel()
+            if self.signup_runner:
+                self.signup_runner.cancel()
             # Persist the round so nothing is lost on close (cleared only by Reset round).
             self._persist_round()
             self._persist_plan()

@@ -34,11 +34,13 @@ from .automation import (
     EligibilityError,
     LoginRequired,
     PickRequest,
+    SignupError,
     SubmissionError,
 )
 from .crypto import CredentialCipher
 from .models import SubmissionLog
 from .repository import Repository
+from .signup import SignupResult, build_profile
 
 log = logging.getLogger(__name__)
 
@@ -248,3 +250,153 @@ class ConcurrentRunner:
             success=success,
             message=message,
         )
+
+
+
+# --------------------------------------------------------------------------- #
+# Sign up runner
+# --------------------------------------------------------------------------- #
+@dataclass
+class SignupCallbacks:
+    on_task_start: Callable[[str], None] = _noop           # email
+    on_status: Callable[[str, str], None] = _noop          # email, message
+    on_result: Callable[[SignupResult], None] = _noop
+    on_progress: Callable[[int, int], None] = _noop        # done, total
+    should_cancel: Callable[[], bool] = field(default=lambda: False)
+
+
+class SignupRunner:
+    """Register many new accounts concurrently from a list of emails.
+
+    For each email: fabricate a random identity, create the local account row
+    (which allocates an isolated Chrome profile), drive the site's registration
+    form in that profile, and -- on success -- mark the session valid so the
+    account lands in Accounts already logged in. On failure the just-created
+    row is removed so only completed signups remain. Emails that already exist
+    as accounts are skipped.
+    """
+
+    def __init__(
+        self,
+        *,
+        street: str = "",
+        city: str = "",
+        state: str = "",
+        postal_code: str = "",
+        country: str = "United States",
+        concurrency: int = 1,
+        headless: bool = False,
+        launch_stagger: float = 6.0,
+        proxies: Optional[list[str]] = None,
+        signup_timeout: int = 45,
+    ) -> None:
+        self.street = street
+        self.city = city
+        self.state = state
+        self.postal_code = postal_code
+        self.country = country or "United States"
+        self.concurrency = max(1, min(15, concurrency))
+        self.headless = headless
+        self.launch_stagger = max(0.0, launch_stagger)
+        self.proxies = [p for p in (proxies or []) if p.strip()]
+        self.signup_timeout = signup_timeout
+
+        self._cipher = CredentialCipher()
+        self._launch_lock = threading.Lock()
+        self._last_launch = 0.0
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def _stagger(self) -> None:
+        if self.launch_stagger <= 0:
+            return
+        with self._launch_lock:
+            now = time.monotonic()
+            wait = self._last_launch + self.launch_stagger - now
+            if wait > 0:
+                time.sleep(wait)
+            self._last_launch = time.monotonic()
+
+    def run(
+        self,
+        emails: list[str],
+        callbacks: Optional[SignupCallbacks] = None,
+    ) -> list[SignupResult]:
+        cb = callbacks or SignupCallbacks()
+        total = len(emails)
+        results: list[SignupResult] = []
+        done = 0
+        should_cancel = lambda: self._cancel.is_set() or cb.should_cancel()  # noqa: E731
+
+        with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
+            future_map = {
+                pool.submit(self._signup_one, idx, email, cb, should_cancel): email
+                for idx, email in enumerate(emails)
+            }
+            for future in as_completed(future_map):
+                res = future.result()
+                results.append(res)
+                cb.on_result(res)
+                done += 1
+                cb.on_progress(done, total)
+        return results
+
+    def _signup_one(
+        self,
+        index: int,
+        email: str,
+        cb: SignupCallbacks,
+        should_cancel: Callable[[], bool],
+    ) -> SignupResult:
+        email = (email or "").strip()
+        status = lambda m: cb.on_status(email, m)  # noqa: E731
+
+        if should_cancel():
+            return SignupResult(email, False, "Cancelled before start.")
+        cb.on_task_start(email)
+
+        repo = Repository(cipher=self._cipher)
+        account = None
+        try:
+            if repo.email_exists(email):
+                return SignupResult(email, False, "Skipped - already an account.")
+
+            profile = build_profile(
+                email,
+                street=self.street, city=self.city, state=self.state,
+                postal_code=self.postal_code, country=self.country,
+            )
+            label = email.split("@", 1)[0]
+            account = repo.add_account(label, email, profile.password)
+
+            proxy = self.proxies[index % len(self.proxies)] if self.proxies else None
+            self._stagger()
+            if should_cancel():
+                repo.delete_account(account.id)
+                return SignupResult(email, False, "Cancelled.")
+
+            with automation.chrome_session(
+                account.profile_dir, headless=self.headless, proxy=proxy
+            ) as driver:
+                automation.do_signup(driver, profile, status_cb=status, timeout=self.signup_timeout)
+
+            # Registered + logged in; the profile now holds the session.
+            repo.set_session_valid(account.id, True)
+            status("Registered and saved.")
+            return SignupResult(
+                email, True, "Registered and logged in.",
+                password=profile.password, account_id=account.id,
+            )
+        except SignupError as exc:
+            if account is not None:
+                repo.delete_account(account.id)
+            return SignupResult(email, False, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Unexpected signup error for %s", email)
+            if account is not None:
+                repo.delete_account(account.id)
+            return SignupResult(email, False, f"Unexpected error: {exc}")
+        finally:
+            repo.close()

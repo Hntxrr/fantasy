@@ -119,6 +119,48 @@ print("after reset: run rows:", len(app2.run_tree.get_children()))
 print("after reset: accounts kept:", app2.repo.count_accounts())
 print("after reset: alias kept:", app2.repo.get_aliases())
 
+# --- Sign Up flow (browser + site mocked; no real Chrome) ---
+import contextlib
+from rmfantasy import runner as _runnermod
+from rmfantasy.automation import SignupError as _SignupError
+from rmfantasy.signup import generate_identity
+
+
+@contextlib.contextmanager
+def _fake_session(profile_dir, headless=False, proxy=None):
+    yield object()
+
+
+def _fake_do_signup(driver, profile, status_cb=None, timeout=30):
+    if status_cb:
+        status_cb("mock: filling form")
+    if profile.email.startswith("fail"):
+        raise _SignupError("mock: form not found")
+
+
+_runnermod.automation.chrome_session = _fake_session
+_runnermod.automation.do_signup = _fake_do_signup
+
+before = app2.repo.count_accounts()
+sr = _runnermod.SignupRunner(
+    street="1 A St", city="Provo", state="Utah", postal_code="84601",
+    concurrency=1, launch_stagger=0,
+)
+results = {r.email: r for r in sr.run(["new1@ex.com", "fail2@ex.com", "user0@ex.com"])}
+print("signup success (expect True):",
+      results["new1@ex.com"].success and bool(results["new1@ex.com"].password))
+print("signup failure (expect False):", results["fail2@ex.com"].success)
+print("signup skip existing (expect True):", "skip" in results["user0@ex.com"].message.lower())
+print("accounts delta (expect 1):", app2.repo.count_accounts() - before)
+_accts = {a.email: a for a in app2.repo.list_accounts()}
+print("new account logged in (expect True):", _accts["new1@ex.com"].session_valid)
+app2._append_signup_file("new1@ex.com", results["new1@ex.com"].password)
+print("signups file has line (expect True):",
+      "new1@ex.com" in open(appmod.config.SIGNUPS_PATH).read())
+_idn = generate_identity()
+print("identity generated (expect True):",
+      all([_idn.first_name, _idn.last_name, _idn.phone, _idn.nickname, len(_idn.password) >= 10]))
+
 app2.update()
 app2.after(50, app2.destroy)
 app2.mainloop()
