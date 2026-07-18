@@ -277,7 +277,7 @@ class Repository:
         """
         for key in (
             "round_lineups_text", "round_wildcards_text",
-            "round_plan_json", "round_status_json",
+            "round_plan_json", "round_status_json", "round_start_account_id",
         ):
             self.conn.execute("DELETE FROM meta WHERE key = ?", (key,))
         self.conn.execute("DELETE FROM submission_log")

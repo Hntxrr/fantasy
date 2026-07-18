@@ -20,13 +20,20 @@ from __future__ import annotations
 
 import json
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
 from dataclasses import asdict
+from pathlib import Path
 from tkinter import messagebox, ttk
 
 import customtkinter as ctk
+
+try:  # Pillow ships with CustomTkinter; guard just in case.
+    from PIL import Image
+except Exception:  # noqa: BLE001
+    Image = None  # type: ignore[assignment]
 
 from .. import automation, config
 from ..assignment import AssignmentPlan, RoundAssignment, build_plan
@@ -39,6 +46,46 @@ ctk.set_default_color_theme("dark-blue")
 
 PAD = 8
 
+# --------------------------------------------------------------------------- #
+# RapidMoto brand palette (clean dark UI, blue accent to match the RM logo).
+# --------------------------------------------------------------------------- #
+BG          = "#0b0d12"   # window background
+SURFACE     = "#14161f"   # cards / frames
+SURFACE_2   = "#1a1d28"   # nested surfaces, inputs
+HOVER       = "#20242f"
+BORDER      = "#262a36"
+FG          = "#f2f4f8"   # primary text
+FG_MUTED    = "#9aa3b2"   # secondary text
+FG_FAINT    = "#6b7280"
+
+BRAND       = "#2f6bff"   # RapidMoto blue
+BRAND_HOVER = "#1f5aef"
+SUCCESS     = "#22c55e"
+SUCCESS_HOV = "#1ea34e"
+DANGER      = "#ef4444"
+DANGER_HOV  = "#dc3838"
+WARNING     = "#e0951a"
+WARNING_HOV = "#c98614"
+NEUTRAL     = "#3a3f4b"
+NEUTRAL_HOV = "#474d5b"
+
+# Treeview (ttk) tag colours.
+ROW_OK      = "#5ce08a"
+ROW_FAIL    = "#ff8a8a"
+ROW_BUSY    = "#ffd27f"
+ROW_SKIP    = "#7b828e"
+
+# Asset locations (logo + window/exe icon). Missing files degrade gracefully.
+ASSETS_DIR    = Path(__file__).resolve().parent / "assets"
+LOGO_PATH     = ASSETS_DIR / "logo.png"
+ICON_PNG_PATH = ASSETS_DIR / "icon.png"
+ICON_ICO_PATH = ASSETS_DIR / "icon.ico"
+
+
+def _fmt_account_choice(index: int, account) -> str:
+    """One dropdown line for an account: '12. label  (email)' (1-based)."""
+    return f"{index + 1}. {account.label}  ({account.email})"
+
 
 def _plan_to_dict(plan: AssignmentPlan) -> dict:
     """Serialize an AssignmentPlan for persistence between app runs."""
@@ -49,6 +96,8 @@ def _plan_to_dict(plan: AssignmentPlan) -> dict:
         "accounts_available": plan.accounts_available,
         "unassigned_pairs": [list(p) for p in plan.unassigned_pairs],
         "idle_accounts": list(plan.idle_accounts),
+        "start_offset": plan.start_offset,
+        "skipped_before": plan.skipped_before,
         "assignments": [asdict(a) for a in plan.assignments],
     }
 
@@ -62,18 +111,71 @@ def _plan_from_dict(d: dict) -> AssignmentPlan:
         accounts_available=d.get("accounts_available", 0),
         unassigned_pairs=[tuple(p) for p in d.get("unassigned_pairs", [])],
         idle_accounts=list(d.get("idle_accounts", [])),
+        start_offset=d.get("start_offset", 0),
+        skipped_before=d.get("skipped_before", 0),
     )
+
+
+class SearchableComboBox(ctk.CTkComboBox):
+    """A CTkComboBox whose dropdown filters as you type.
+
+    Handy for picking from hundreds of accounts: start typing a label, email or
+    the account number and the list narrows. If nothing matches, the full list
+    is kept so you're never stuck. Callers should resolve the *selection* with a
+    tolerant match (exact line, else substring) rather than trusting the raw
+    text, since free typing is allowed.
+    """
+
+    def __init__(self, master, values=None, **kwargs):
+        self._all_values: list[str] = list(values or [])
+        super().__init__(master, values=self._all_values or [""], **kwargs)
+        try:
+            self._entry.bind("<KeyRelease>", self._on_key_release)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def set_values(self, values) -> None:
+        """Replace the full backing list (and what the dropdown shows)."""
+        self._all_values = list(values)
+        self.configure(values=self._all_values or [""])
+
+    def all_values(self) -> list[str]:
+        return list(self._all_values)
+
+    def _on_key_release(self, event) -> None:
+        # Let navigation / commit keys pass through untouched.
+        if event.keysym in ("Up", "Down", "Return", "Escape", "Tab", "Left", "Right"):
+            return
+        typed = self.get().strip().lower()
+        if not typed:
+            filtered = self._all_values
+        else:
+            filtered = [v for v in self._all_values if typed in v.lower()]
+        # Narrow the dropdown; never leave it empty so the arrow still works.
+        self.configure(values=filtered or self._all_values or [""])
+        try:
+            self._open_dropdown_menu()
+            self._entry.focus_set()
+            self._entry.icursor("end")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("RMFantasySMX Pick Bot")
-        self.geometry("1120x760")
-        self.minsize(960, 640)
+        self.title("RapidMoto - Fantasy Pick Bot")
+        self.geometry("1160x800")
+        self.minsize(980, 660)
+        self.configure(fg_color=BG)
 
         config.ensure_dirs()
         self.repo = Repository()  # main-thread connection
+
+        # Ordered snapshot of all accounts, used by the "Start at account"
+        # dropdown on the This Round tab (kept in sync with refresh_accounts).
+        self._round_accounts: list = []
+        self._logo_image = None  # keep a ref so CTkImage isn't GC'd
 
         # Shared run state.
         self.resolver: RiderResolver | None = None
@@ -88,9 +190,18 @@ class App(ctk.CTk):
         self._watch_threads: list = []
 
         self._style_treeview()
+        self._apply_window_icon()
+        self._build_header()
 
-        self.tabs = ctk.CTkTabview(self)
-        self.tabs.pack(fill="both", expand=True, padx=PAD, pady=PAD)
+        self.tabs = ctk.CTkTabview(
+            self, fg_color=SURFACE, segmented_button_fg_color=SURFACE_2,
+            segmented_button_selected_color=BRAND,
+            segmented_button_selected_hover_color=BRAND_HOVER,
+            segmented_button_unselected_color=SURFACE_2,
+            segmented_button_unselected_hover_color=HOVER,
+            text_color=FG, border_width=0,
+        )
+        self.tabs.pack(fill="both", expand=True, padx=PAD, pady=(0, PAD))
         self.tabs.add("Accounts")
         self.tabs.add("This Round")
         self.tabs.add("Run Picks")
@@ -110,6 +221,71 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ================================================================== #
+    # Header / branding
+    # ================================================================== #
+    def _apply_window_icon(self) -> None:
+        """Set the OS window icon from bundled assets (best effort)."""
+        try:
+            if sys.platform.startswith("win") and ICON_ICO_PATH.exists():
+                self.iconbitmap(str(ICON_ICO_PATH))
+            elif ICON_PNG_PATH.exists():
+                self._win_icon = tk.PhotoImage(file=str(ICON_PNG_PATH))
+                self.iconphoto(True, self._win_icon)
+            elif LOGO_PATH.exists():
+                self._win_icon = tk.PhotoImage(file=str(LOGO_PATH))
+                self.iconphoto(True, self._win_icon)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _build_header(self) -> None:
+        """Top branding bar: RM logo + RapidMoto wordmark + tagline."""
+        bar = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=14, height=76)
+        bar.pack(fill="x", padx=PAD, pady=(PAD, PAD))
+        bar.pack_propagate(False)
+
+        left = ctk.CTkFrame(bar, fg_color="transparent")
+        left.pack(side="left", padx=(16, 0), pady=10)
+
+        # Logo image (falls back to a text badge if the asset is missing).
+        logo_added = False
+        if Image is not None and LOGO_PATH.exists():
+            try:
+                img = Image.open(LOGO_PATH)
+                w, h = img.size
+                target_h = 44
+                target_w = max(1, int(w * (target_h / h)))
+                self._logo_image = ctk.CTkImage(
+                    light_image=img, dark_image=img, size=(target_w, target_h)
+                )
+                ctk.CTkLabel(left, image=self._logo_image, text="").pack(side="left")
+                logo_added = True
+            except Exception:  # noqa: BLE001
+                logo_added = False
+        if not logo_added:
+            badge = ctk.CTkLabel(
+                left, text="RM", fg_color=BRAND, corner_radius=8,
+                width=54, height=44, text_color="#ffffff",
+                font=ctk.CTkFont(size=22, weight="bold"),
+            )
+            badge.pack(side="left")
+
+        text_wrap = ctk.CTkFrame(bar, fg_color="transparent")
+        text_wrap.pack(side="left", padx=14, pady=10)
+        ctk.CTkLabel(
+            text_wrap, text="RapidMoto",
+            font=ctk.CTkFont(size=24, weight="bold"), text_color=FG,
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            text_wrap, text="Fantasy SMX  \u2022  automated weekly picks",
+            font=ctk.CTkFont(size=12), text_color=FG_MUTED,
+        ).pack(anchor="w")
+
+        self.header_status = ctk.CTkLabel(
+            bar, text="", font=ctk.CTkFont(size=12), text_color=BRAND,
+        )
+        self.header_status.pack(side="right", padx=18)
+
+    # ================================================================== #
     # Styling
     # ================================================================== #
     def _style_treeview(self) -> None:
@@ -120,11 +296,17 @@ class App(ctk.CTk):
             pass
         style.configure(
             "Treeview",
-            background="#242424", foreground="#e6e6e6", fieldbackground="#242424",
-            rowheight=24, borderwidth=0,
+            background=SURFACE_2, foreground=FG, fieldbackground=SURFACE_2,
+            rowheight=26, borderwidth=0,
         )
-        style.configure("Treeview.Heading", background="#1a1a1a", foreground="#dddddd")
-        style.map("Treeview", background=[("selected", "#2a5d9c")])
+        style.configure(
+            "Treeview.Heading",
+            background=SURFACE, foreground=FG_MUTED,
+            relief="flat", borderwidth=0,
+        )
+        style.map("Treeview.Heading", background=[("active", HOVER)])
+        style.map("Treeview", background=[("selected", BRAND)],
+                  foreground=[("selected", "#ffffff")])
 
     # ================================================================== #
     # Accounts tab
@@ -222,6 +404,8 @@ class App(ctk.CTk):
                 values=(acc.email, "valid" if acc.session_valid else "-"),
             )
         self.accounts_count_lbl.configure(text=f"Accounts: {len(accounts)}")
+        # Keep the "Start at account" dropdown (This Round tab) in sync.
+        self._refresh_start_at_choices()
 
     def _selected_account_id(self) -> int | None:
         sel = self.accounts_tree.selection()
@@ -265,25 +449,109 @@ class App(ctk.CTk):
         self.wildcards_box = ctk.CTkTextbox(tab)
         self.wildcards_box.grid(row=1, column=1, sticky="nsew", padx=PAD, pady=PAD)
 
+        # --- Start-at-account chooser -------------------------------- #
+        start_card = ctk.CTkFrame(tab, fg_color=SURFACE_2, corner_radius=12)
+        start_card.grid(row=2, column=0, columnspan=2, sticky="ew", padx=PAD, pady=(0, 4))
+        start_card.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            start_card, text="Start at account:",
+            font=ctk.CTkFont(size=13, weight="bold"), text_color=FG,
+        ).grid(row=0, column=0, padx=(14, 8), pady=10, sticky="w")
+        self.start_at_combo = SearchableComboBox(
+            start_card, values=[], width=420,
+            fg_color=SURFACE, button_color=BRAND, button_hover_color=BRAND_HOVER,
+            border_color=BORDER, dropdown_fg_color=SURFACE,
+            dropdown_hover_color=HOVER, dropdown_text_color=FG,
+        )
+        self.start_at_combo.grid(row=0, column=1, padx=4, pady=10, sticky="w")
+        ctk.CTkButton(
+            start_card, text="First account", width=110, fg_color=NEUTRAL,
+            hover_color=NEUTRAL_HOV, command=self.on_start_at_first,
+        ).grid(row=0, column=2, padx=(4, 14), pady=10)
+        ctk.CTkLabel(
+            start_card,
+            text=("The round assigns from this account and goes DOWN the list. "
+                  "Pick any account you own to skip ones already used in a "
+                  "previous round (type to search)."),
+            text_color=FG_MUTED, wraplength=1040, justify="left",
+        ).grid(row=1, column=0, columnspan=3, padx=14, pady=(0, 10), sticky="w")
+
         controls = ctk.CTkFrame(tab, fg_color="transparent")
-        controls.grid(row=2, column=0, columnspan=2, sticky="ew", padx=PAD)
+        controls.grid(row=3, column=0, columnspan=2, sticky="ew", padx=PAD)
         self.scrape_btn = ctk.CTkButton(controls, text="Scrape riders from site",
+                                        fg_color=NEUTRAL, hover_color=NEUTRAL_HOV,
                                         command=self.on_scrape_roster)
         self.scrape_btn.pack(side="left", padx=4)
-        ctk.CTkButton(controls, text="Resolve & preview", command=self.on_resolve).pack(side="left", padx=4)
-        ctk.CTkButton(controls, text="Fix ambiguous names", fg_color="#7a5a1e",
-                      hover_color="#8f6a26", command=self.on_fix_ambiguous).pack(side="left", padx=4)
-        ctk.CTkButton(controls, text="Lock in assignments", fg_color="#2c6e49",
-                      hover_color="#358257", command=self.on_lock_plan).pack(side="left", padx=4)
-        self.roster_lbl = ctk.CTkLabel(controls, text="Roster: (not scraped)")
+        ctk.CTkButton(controls, text="Resolve & preview", fg_color=BRAND,
+                      hover_color=BRAND_HOVER, command=self.on_resolve).pack(side="left", padx=4)
+        ctk.CTkButton(controls, text="Fix ambiguous names", fg_color=WARNING,
+                      hover_color=WARNING_HOV, command=self.on_fix_ambiguous).pack(side="left", padx=4)
+        ctk.CTkButton(controls, text="Lock in assignments", fg_color=SUCCESS,
+                      hover_color=SUCCESS_HOV, command=self.on_lock_plan).pack(side="left", padx=4)
+        self.roster_lbl = ctk.CTkLabel(controls, text="Roster: (not scraped)", text_color=FG_MUTED)
         self.roster_lbl.pack(side="left", padx=12)
 
-        self.round_summary = ctk.CTkLabel(tab, text="", anchor="w", text_color="#d0d0ff")
-        self.round_summary.grid(row=3, column=0, columnspan=2, sticky="ew", padx=PAD)
+        self.round_summary = ctk.CTkLabel(tab, text="", anchor="w", text_color=BRAND)
+        self.round_summary.grid(row=4, column=0, columnspan=2, sticky="ew", padx=PAD)
 
-        self.preview_box = ctk.CTkTextbox(tab, height=170)
-        self.preview_box.grid(row=4, column=0, columnspan=2, sticky="ew", padx=PAD, pady=PAD)
+        self.preview_box = ctk.CTkTextbox(tab, height=170, fg_color=SURFACE_2)
+        self.preview_box.grid(row=5, column=0, columnspan=2, sticky="ew", padx=PAD, pady=PAD)
         self.preview_box.configure(state="disabled")
+
+    # --- Start-at-account helpers ------------------------------------ #
+    def _refresh_start_at_choices(self) -> None:
+        """Sync the This Round 'Start at account' dropdown with all accounts."""
+        if not hasattr(self, "start_at_combo"):
+            return
+        self._round_accounts = self.repo.list_accounts()
+        choices = [_fmt_account_choice(i, a) for i, a in enumerate(self._round_accounts)]
+        prev = self.start_at_combo.get()
+        self.start_at_combo.set_values(choices)
+        # Keep the current selection if still valid; otherwise restore the
+        # persisted start account (by id); otherwise default to the first.
+        if prev in choices:
+            self.start_at_combo.set(prev)
+            return
+        persisted = self.repo.get_meta("round_start_account_id")
+        if persisted:
+            try:
+                pid = int(persisted)
+                for i, a in enumerate(self._round_accounts):
+                    if a.id == pid:
+                        self.start_at_combo.set(choices[i])
+                        return
+            except (ValueError, TypeError):
+                pass
+        if choices:
+            self.start_at_combo.set(choices[0])
+        else:
+            self.start_at_combo.set("")
+
+    def _selected_start_offset(self) -> int:
+        """0-based index into the full accounts list for the chosen start.
+
+        Tolerant: matches the exact dropdown line first, then a substring
+        (label / email / number the user typed), else defaults to 0.
+        """
+        accounts = self._round_accounts or self.repo.list_accounts()
+        self._round_accounts = accounts
+        if not accounts:
+            return 0
+        val = self.start_at_combo.get().strip().lower() if hasattr(self, "start_at_combo") else ""
+        if not val:
+            return 0
+        choices = [_fmt_account_choice(i, a).lower() for i, a in enumerate(accounts)]
+        for i, c in enumerate(choices):
+            if c == val:
+                return i
+        for i, c in enumerate(choices):
+            if val in c:
+                return i
+        return 0
+
+    def on_start_at_first(self) -> None:
+        if self._round_accounts:
+            self.start_at_combo.set(_fmt_account_choice(0, self._round_accounts[0]))
 
     def _parse_lineups(self) -> list[list[str]]:
         lines = [ln.strip() for ln in self.lineups_box.get("1.0", "end").splitlines() if ln.strip()]
@@ -370,9 +638,11 @@ class App(ctk.CTk):
                 lines.append(f"{w} -> [{flag}: {r.name or '?'}{(' / ' + alts) if alts else ''}]")
                 resolved_wildcards.append(r.name or f"?{w}")
 
-        # Assignment math preview.
+        # Assignment math preview (honours the chosen start account).
         accounts = self.repo.list_accounts()
-        plan = build_plan(resolved_lineups, resolved_wildcards, accounts)
+        self._round_accounts = accounts
+        start_offset = self._selected_start_offset()
+        plan = build_plan(resolved_lineups, resolved_wildcards, accounts, start_offset)
         self.round_summary.configure(text=plan.summary())
         self._pending_resolved = (resolved_lineups, resolved_wildcards)
 
@@ -427,32 +697,34 @@ class App(ctk.CTk):
         if not accounts:
             messagebox.showwarning("No accounts", "Import accounts before locking in a plan.")
             return
-        self.plan = build_plan(resolved_lineups, resolved_wildcards, accounts)
+        self._round_accounts = accounts
+        start_offset = self._selected_start_offset()
+        self.plan = build_plan(resolved_lineups, resolved_wildcards, accounts, start_offset)
         self._run_status = {}
+        # The Run Picks "begin at" dropdown is a within-plan skip; reset to row 1.
         self._persist_round()
         self._persist_plan()
         self._persist_status()
         self._populate_run_table()
+        self._set_run_start_position(1)
 
-        # Ask which account position to start from (1 = first, default).
-        # This just sets the same "Start from account #" field on Run Picks,
-        # which you can still change there before running.
-        dlg = StartFromDialog(self, max_n=self.plan.assigned_count, default=1)
-        self.wait_window(dlg)
-        start = dlg.result if dlg.result is not None else 1
-        self.start_entry.delete(0, "end")
-        self.start_entry.insert(0, str(start))
-
+        start_label = ""
+        if self.plan.assignments:
+            first = self.plan.assignments[0]
+            start_label = (f"\nFirst account: #{self.plan.start_offset + 1} "
+                           f"{first.account_label} ({first.account_email}).")
         warn = ""
         if self.plan.unassigned_pairs:
-            warn = f"\n\nWARNING: {len(self.plan.unassigned_pairs)} pairs have no account (need more accounts)."
+            warn = (f"\n\nWARNING: {len(self.plan.unassigned_pairs)} pairs have no "
+                    f"account from the start point onward (add more accounts or "
+                    f"start higher up the list).")
         if self.plan.idle_accounts:
             warn += f"\n{len(self.plan.idle_accounts)} accounts will be idle."
         messagebox.showinfo(
             "Plan locked in",
-            f"{self.plan.assigned_count} account submissions ready.\n"
-            f"Run starts at account #{start} - each account submits its own "
-            f"assigned lineup + wildcard.{warn}\n\nGo to the 'Run Picks' tab.",
+            f"{self.plan.assigned_count} account submissions ready."
+            f"{start_label}\nEach account submits its own assigned lineup + "
+            f"wildcard, going down the list.{warn}\n\nGo to the 'Run Picks' tab.",
         )
         self.tabs.set("Run Picks")
 
@@ -521,15 +793,19 @@ class App(ctk.CTk):
         ctk.CTkCheckBox(opts, text="Headless", variable=self.headless_var
                         ).grid(row=0, column=7, padx=12, sticky="e")
 
-        ctk.CTkLabel(opts, text="Start from account #:").grid(row=1, column=0, padx=(8, 4), pady=(0, 6), sticky="w")
-        self.start_entry = ctk.CTkEntry(opts, width=70)
-        self.start_entry.insert(0, "1")
-        self.start_entry.grid(row=1, column=1, padx=4, pady=(0, 6), sticky="w")
-        ctk.CTkButton(opts, text="Set from selected row", width=150,
-                      command=self.on_set_start_from_selected
-                      ).grid(row=1, column=2, columnspan=2, padx=4, pady=(0, 6), sticky="w")
-        ctk.CTkLabel(opts, text="(skips rows above this position; each account still submits its own assigned lineup + wildcard)",
-                     text_color="#9aa").grid(row=1, column=4, columnspan=4, padx=4, pady=(0, 6), sticky="w")
+        ctk.CTkLabel(opts, text="Begin run at:").grid(row=1, column=0, padx=(8, 4), pady=(0, 6), sticky="w")
+        self.start_combo = SearchableComboBox(
+            opts, values=[], width=300,
+            fg_color=SURFACE, button_color=BRAND, button_hover_color=BRAND_HOVER,
+            border_color=BORDER, dropdown_fg_color=SURFACE,
+            dropdown_hover_color=HOVER, dropdown_text_color=FG,
+        )
+        self.start_combo.grid(row=1, column=1, columnspan=2, padx=4, pady=(0, 6), sticky="w")
+        ctk.CTkButton(opts, text="Set from selected row", width=150, fg_color=NEUTRAL,
+                      hover_color=NEUTRAL_HOV, command=self.on_set_start_from_selected
+                      ).grid(row=1, column=3, padx=4, pady=(0, 6), sticky="w")
+        ctk.CTkLabel(opts, text="(skips rows above this one; each account still submits its own assigned lineup + wildcard)",
+                     text_color=FG_MUTED).grid(row=1, column=4, columnspan=4, padx=4, pady=(0, 6), sticky="w")
 
         ctk.CTkLabel(opts, text="Proxies (one host:port per line, optional; round-robin):"
                      ).grid(row=2, column=0, columnspan=8, sticky="w", padx=8)
@@ -602,6 +878,7 @@ class App(ctk.CTk):
             self.run_tree.delete(iid)
         self._run_row_by_account.clear()
         if not self.plan:
+            self._refresh_run_start_choices()
             return
         for pos, a in enumerate(self.plan.assignments, 1):
             iid = f"acc{a.account_id}"
@@ -614,6 +891,53 @@ class App(ctk.CTk):
                 values=(pos, a.account_label, f"#{a.lineup_index}", a.wildcard, status_text),
                 tags=(tag,) if tag else (),
             )
+        self._refresh_run_start_choices()
+
+    # --- Run-start (within-plan skip) helpers ------------------------ #
+    def _run_start_choices(self) -> list[str]:
+        if not self.plan:
+            return []
+        return [f"{i + 1}. {a.account_label}  ({a.account_email})"
+                for i, a in enumerate(self.plan.assignments)]
+
+    def _refresh_run_start_choices(self) -> None:
+        if not hasattr(self, "start_combo"):
+            return
+        choices = self._run_start_choices()
+        prev = self.start_combo.get()
+        self.start_combo.set_values(choices)
+        if prev in choices:
+            self.start_combo.set(prev)
+        elif choices:
+            self.start_combo.set(choices[0])
+        else:
+            self.start_combo.set("")
+
+    def _set_run_start_position(self, pos: int) -> None:
+        """Select the given 1-based plan position in the Run Picks dropdown."""
+        if not hasattr(self, "start_combo"):
+            return
+        choices = self.start_combo.all_values() or self._run_start_choices()
+        if 1 <= pos <= len(choices):
+            self.start_combo.set(choices[pos - 1])
+        elif choices:
+            self.start_combo.set(choices[0])
+
+    def _selected_run_start_position(self) -> int:
+        """Parse the 1-based plan position from the Run Picks dropdown value."""
+        if not hasattr(self, "start_combo"):
+            return 1
+        val = self.start_combo.get().strip()
+        digits = ""
+        for ch in val:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        try:
+            return max(1, int(digits))
+        except ValueError:
+            return 1
 
     def _read_run_options(self):
         try:
@@ -634,10 +958,7 @@ class App(ctk.CTk):
             messagebox.showwarning("No plan", "Lock in a plan on the 'This Round' tab first.")
             return
         assignments = list(self.plan.assignments)
-        try:
-            start = int(self.start_entry.get() or "1")
-        except ValueError:
-            start = 1
+        start = self._selected_run_start_position()
         start = max(1, min(start, len(assignments)))
         active = assignments[start - 1:]
         # Reset row states: mark skipped ones before the start, others Pending.
@@ -688,8 +1009,10 @@ class App(ctk.CTk):
             messagebox.showinfo("No selection", "Select a row in the table first.")
             return
         num = self.run_tree.set(sel[0], "num")
-        self.start_entry.delete(0, "end")
-        self.start_entry.insert(0, str(num))
+        try:
+            self._set_run_start_position(int(num))
+        except (ValueError, TypeError):
+            pass
 
     def on_watch_selected(self):
         if self.run_thread and self.run_thread.is_alive():
@@ -848,6 +1171,12 @@ class App(ctk.CTk):
     def _persist_round(self):
         self.repo.set_meta("round_lineups_text", self.lineups_box.get("1.0", "end").strip())
         self.repo.set_meta("round_wildcards_text", self.wildcards_box.get("1.0", "end").strip())
+        # Remember which account the round starts at (by id, so it survives
+        # reordering / re-import as long as that account still exists).
+        accounts = self._round_accounts or self.repo.list_accounts()
+        off = self._selected_start_offset()
+        if accounts and 0 <= off < len(accounts):
+            self.repo.set_meta("round_start_account_id", str(accounts[off].id))
 
     def _persist_plan(self):
         if self.plan:

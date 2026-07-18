@@ -91,6 +91,27 @@ sd.entry.insert(0, "99")
 sd._ok()
 print("start dialog clamp (expect 8):", sd.result)
 
+# --- Start-at-account dropdown: pick the 5th account, rebuild, verify offset ---
+app2._refresh_start_at_choices()
+choices = app2.start_at_combo.all_values()
+print("start-at choices count (expect 16):", len(choices))
+app2.start_at_combo.set(choices[4])            # 5th account
+off = app2._selected_start_offset()
+print("start-at offset (expect 4):", off)
+accs = app2.repo.list_accounts()
+p_off = build_plan([["a", "b", "c", "d", "e"]], ["W0", "W1", "W2"], accs, off)
+print("start-at first acct == 5th:", p_off.assignments[0].account_label == accs[4].label)
+print("start-at skipped_before (expect 4):", p_off.skipped_before)
+# Free-typed substring should still resolve to an account line.
+app2.start_at_combo.set(accs[7].label)
+print("start-at substring offset (expect 7):", app2._selected_start_offset())
+# Run Picks within-plan skip dropdown parses the leading position number.
+app2.plan = build_plan(
+    [["a", "b", "c", "d", "e"], ["f", "g", "h", "i", "j"]], ["W0", "W1"], accs)
+app2._populate_run_table()
+app2._set_run_start_position(3)
+print("run-start position parsed (expect 3):", app2._selected_run_start_position())
+
 # --- Reset round: clears round + history, keeps accounts. ---
 app2.on_reset_round()
 print("after reset: plan:", app2.plan)
