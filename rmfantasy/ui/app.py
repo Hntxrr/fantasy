@@ -529,11 +529,24 @@ class App(ctk.CTk):
         self.events.put(("chrome_opened", len(targets)))
 
     def on_refresh_logins(self) -> None:
-        """Check which accounts have a live session and mark them valid."""
+        """Check which SELECTED accounts have a live session and mark them valid.
+
+        With nothing selected, offers to check every account.
+        """
         if self.signin_thread and self.signin_thread.is_alive():
             return
-        accts = self.repo.list_accounts()
-        ids = [a.id for a in accts]
+        ids = self._selected_account_ids()
+        if not ids:
+            total = self.repo.count_accounts()
+            if total == 0:
+                return
+            if not messagebox.askyesno(
+                "No selection",
+                f"No accounts are selected. Check ALL {total} accounts?\n\n"
+                f"(Select specific accounts first to check only those.)",
+            ):
+                return
+            ids = [a.id for a in self.repo.list_accounts()]
         if not ids:
             return
         self.refresh_logins_btn.configure(state="disabled", text="Checking...")
