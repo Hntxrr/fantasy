@@ -406,6 +406,22 @@ class App(ctk.CTk):
             hover_color=NEUTRAL_HOV, command=self.on_refresh_logins,
         )
         self.refresh_logins_btn.pack(side="left", padx=4)
+        self.refresh_stop_btn = ctk.CTkButton(
+            signin_btns, text="Stop", fg_color=DANGER, hover_color=DANGER_HOV,
+            width=70, state="disabled", command=self.on_refresh_stop,
+        )
+        self.refresh_stop_btn.pack(side="left", padx=4)
+
+        signin_btns2 = ctk.CTkFrame(right, fg_color="transparent")
+        signin_btns2.grid(row=5, column=0, sticky="ew", padx=6, pady=(0, 6))
+        ctk.CTkButton(
+            signin_btns2, text="Mark selected as logged in", fg_color=SUCCESS,
+            hover_color=SUCCESS_HOV, command=self.on_mark_logged_in,
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            signin_btns2, text="Mark selected as NOT logged in", fg_color=NEUTRAL,
+            hover_color=NEUTRAL_HOV, command=self.on_mark_logged_out,
+        ).pack(side="left", padx=4)
         ctk.CTkLabel(
             right,
             text=("Tip: select accounts \u2192 Open in Chrome, log in normally (real browser "
@@ -551,8 +567,11 @@ class App(ctk.CTk):
             return
         self.refresh_logins_btn.configure(state="disabled", text="Checking...")
         self.open_chrome_btn.configure(state="disabled")
-        self.accounts_status.configure(text=f"Checking login status... 0/{len(ids)}")
-        self.signin_runner = VerifyRunner(ids, concurrency=4, headless=True)
+        self.refresh_stop_btn.configure(state="normal", text="Stop")
+        self.accounts_status.configure(text=f"Quick login check (reading cookies)... 0/{len(ids)}")
+        # Fast mode reads each profile's saved cookies directly -- no browser
+        # launch, so 400+ accounts check in seconds instead of forever.
+        self.signin_runner = VerifyRunner(ids, concurrency=8, fast=True)
         self.signin_thread = threading.Thread(target=self._refresh_logins_worker, args=(ids,), daemon=True)
         self.signin_thread.start()
 
@@ -566,6 +585,33 @@ class App(ctk.CTk):
             self.events.put(("si_done",))
         except Exception as exc:  # noqa: BLE001
             self.events.put(("si_error", str(exc)))
+
+    def on_refresh_stop(self) -> None:
+        if self.signin_runner:
+            self.signin_runner.cancel()
+            self.refresh_stop_btn.configure(state="disabled", text="Stopping...")
+
+    def on_mark_logged_in(self) -> None:
+        """Instantly flag selected accounts as logged in (no check)."""
+        ids = self._selected_account_ids()
+        if not ids:
+            messagebox.showinfo("No selection", "Select the accounts to mark as logged in.")
+            return
+        for aid in ids:
+            self.repo.set_session_valid(aid, True)
+        self.refresh_accounts()
+        self.accounts_status.configure(text=f"Marked {len(ids)} account(s) as logged in.")
+
+    def on_mark_logged_out(self) -> None:
+        """Instantly flag selected accounts as NOT logged in (no check)."""
+        ids = self._selected_account_ids()
+        if not ids:
+            messagebox.showinfo("No selection", "Select the accounts to mark as not logged in.")
+            return
+        for aid in ids:
+            self.repo.set_session_valid(aid, False)
+        self.refresh_accounts()
+        self.accounts_status.configure(text=f"Marked {len(ids)} account(s) as not logged in.")
 
     # ================================================================== #
     # Sign Up tab

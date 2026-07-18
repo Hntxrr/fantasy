@@ -360,11 +360,13 @@ def open_profile_browser(profile_dir: str, url: Optional[str] = None) -> None:
     subprocess.Popen(args)
 
 
-def session_is_live(profile_dir: str, headless: bool = True, proxy: Optional[str] = None) -> bool:
-    """Open the profile briefly (Selenium) and report if it's logged in.
+def check_login_state(profile_dir: str, headless: bool = True, proxy: Optional[str] = None) -> str:
+    """Open the profile briefly and report 'in' / 'out' / 'unknown'.
 
-    Captcha-free: it only loads the page and checks for editable rider dropdowns
-    -- it never attempts a login. Used by 'Refresh login status'.
+    Captcha-free (never attempts a login). Round-independent: it does NOT rely on
+    editable pick dropdowns (which only exist while a round is open), so a
+    logged-in account between rounds still reads 'in'. Returns 'unknown' when it
+    can't tell, so callers can leave the account's status untouched.
     """
     with chrome_session(profile_dir, headless=headless, proxy=proxy) as driver:
         driver.get(config.BASE_URL)
@@ -376,7 +378,60 @@ def session_is_live(profile_dir: str, headless: bool = True, proxy: Optional[str
         except TimeoutException:
             pass
         time.sleep(1.0)
-        return is_logged_in(driver)
+        return login_state(driver)
+
+
+def session_is_live(profile_dir: str, headless: bool = True, proxy: Optional[str] = None) -> bool:
+    """Back-compat wrapper: True only when clearly logged in."""
+    return check_login_state(profile_dir, headless=headless, proxy=proxy) == "in"
+
+
+def profile_has_session(profile_dir: str) -> str:
+    """SUPER-FAST login check: read the profile's cookie DB directly (no browser).
+
+    Returns 'in' if a persistent rmfantasysmx cookie exists (a saved login),
+    'out' if the site has been visited but has no cookies, or 'unknown' when we
+    can't tell (so the caller leaves the account's flag untouched). This is
+    ~instant per account -- no Chrome launch.
+    """
+    import sqlite3
+
+    candidates = [
+        os.path.join(profile_dir, "Default", "Network", "Cookies"),
+        os.path.join(profile_dir, "Default", "Cookies"),
+        os.path.join(profile_dir, "Network", "Cookies"),
+        os.path.join(profile_dir, "Cookies"),
+    ]
+    path = next((p for p in candidates if os.path.exists(p)), None)
+    if path is None:
+        return "unknown"
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    try:
+        try:
+            persistent = con.execute(
+                "SELECT COUNT(*) FROM cookies "
+                "WHERE host_key LIKE '%rmfantasysmx%' AND is_persistent=1"
+            ).fetchone()[0]
+        except Exception:  # noqa: BLE001 - older schema without is_persistent
+            persistent = con.execute(
+                "SELECT COUNT(*) FROM cookies WHERE host_key LIKE '%rmfantasysmx%'"
+            ).fetchone()[0]
+        any_site = con.execute(
+            "SELECT COUNT(*) FROM cookies WHERE host_key LIKE '%rmfantasysmx%'"
+        ).fetchone()[0]
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    finally:
+        con.close()
+
+    if persistent > 0:
+        return "in"
+    if any_site == 0:
+        return "out"
+    return "unknown"
 
 
 @contextmanager
@@ -501,6 +556,41 @@ def is_logged_in(driver) -> bool:
         except StaleElementReferenceException:
             continue
     return False
+
+
+def login_state(driver) -> str:
+    """Return 'in' (logged in), 'out' (guest), or 'unknown' (can't tell).
+
+    Round-independent: does NOT depend on editable pick dropdowns (those only
+    exist while a round is open). Uses guest markers instead, so an account that
+    is logged in between rounds still reads 'in'. 'unknown' is returned when the
+    page didn't load properly, so callers can leave the account untouched rather
+    than wrongly flipping it to logged-out.
+    """
+    # Editable rider dropdowns = definitely logged in (only true while open).
+    try:
+        if is_logged_in(driver):
+            return "in"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        body = driver.find_element(By.TAG_NAME, "body").text
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    low = " ".join((body or "").split()).casefold()
+    if len(low) < 200:
+        return "unknown"   # page didn't really render
+    guest_markers = [
+        "sign up or log in",
+        "log in to see your",
+        "are you a new player",
+        "have an existing account",
+        "sign up or log in to submit",
+    ]
+    if any(g in low for g in guest_markers):
+        return "out"
+    # Page loaded and shows no guest prompts -> treat as logged in.
+    return "in"
 
 
 def _click(driver, el) -> None:

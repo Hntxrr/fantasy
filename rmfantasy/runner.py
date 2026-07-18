@@ -545,11 +545,14 @@ class VerifyRunner:
         concurrency: int = 4,
         headless: bool = True,
         proxies: Optional[list[str]] = None,
+        fast: bool = True,
     ) -> None:
         self.account_ids = list(account_ids)
         self.concurrency = max(1, min(15, concurrency))
         self.headless = headless
         self.proxies = [p for p in (proxies or []) if p.strip()]
+        # Fast mode reads the profile cookie DB directly (no browser launch).
+        self.fast = fast
         self._cipher = CredentialCipher()
         self._cancel = threading.Event()
 
@@ -581,12 +584,23 @@ class VerifyRunner:
             if acc is None:
                 return
             proxy = self.proxies[index % len(self.proxies)] if self.proxies else None
-            live = False
+            state = "unknown"
             try:
-                live = automation.session_is_live(acc.profile_dir, headless=self.headless, proxy=proxy)
+                if self.fast:
+                    state = automation.profile_has_session(acc.profile_dir)
+                else:
+                    state = automation.check_login_state(acc.profile_dir, headless=self.headless, proxy=proxy)
             except Exception as exc:  # noqa: BLE001
                 cb.on_status(account_id, f"check failed: {exc}")
-            repo.set_session_valid(account_id, live)
-            cb.on_result(account_id, live, "Logged in" if live else "Not logged in")
+            # Only change the flag on a CLEAR signal; leave it untouched when
+            # 'unknown' so we never wipe a good session (e.g. page didn't load).
+            if state == "in":
+                repo.set_session_valid(account_id, True)
+                cb.on_result(account_id, True, "Logged in")
+            elif state == "out":
+                repo.set_session_valid(account_id, False)
+                cb.on_result(account_id, False, "Not logged in")
+            else:
+                cb.on_result(account_id, False, "Unknown - left unchanged")
         finally:
             repo.close()
