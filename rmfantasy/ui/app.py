@@ -374,6 +374,9 @@ class App(ctk.CTk):
         self.accounts_tree.column("#0", width=140)
         self.accounts_tree.column("email", width=240)
         self.accounts_tree.column("session", width=90, anchor="center")
+        # Logged-in accounts are tinted green; ones needing a login are muted.
+        self.accounts_tree.tag_configure("valid", foreground=ROW_OK)
+        self.accounts_tree.tag_configure("invalid", foreground=FG_MUTED)
         vsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.accounts_tree.yview)
         self.accounts_tree.configure(yscrollcommand=vsb.set)
         self.accounts_tree.grid(row=0, column=0, sticky="nsew")
@@ -413,12 +416,20 @@ class App(ctk.CTk):
         for iid in self.accounts_tree.get_children():
             self.accounts_tree.delete(iid)
         accounts = self.repo.list_accounts()
+        valid_n = 0
         for acc in accounts:
             self.accounts_tree.insert(
                 "", "end", iid=str(acc.id), text=acc.label,
                 values=(acc.email, "valid" if acc.session_valid else "-"),
+                tags=("valid",) if acc.session_valid else ("invalid",),
             )
-        self.accounts_count_lbl.configure(text=f"Accounts: {len(accounts)}")
+            if acc.session_valid:
+                valid_n += 1
+        # Valid (logged-in) accounts are listed first, starting at position 1;
+        # the rest sit below so you can spot and fix the ones not logged in.
+        self.accounts_count_lbl.configure(
+            text=f"Accounts: {len(accounts)}   ({valid_n} logged in)"
+        )
         # Keep the "Start at account" dropdown (This Round tab) in sync.
         self._refresh_start_at_choices()
 
