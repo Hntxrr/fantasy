@@ -488,16 +488,16 @@ class App(ctk.CTk):
         opts.grid_columnconfigure(7, weight=1)
 
         ctk.CTkLabel(opts, text="Concurrent browsers:").grid(row=0, column=0, padx=(8, 4), pady=8)
-        self.conc_value = ctk.CTkLabel(opts, text="10", width=28)
+        self.conc_value = ctk.CTkLabel(opts, text="3", width=28)
         self.conc_slider = ctk.CTkSlider(opts, from_=1, to=15, number_of_steps=14, width=150,
                                          command=lambda v: self.conc_value.configure(text=str(int(v))))
-        self.conc_slider.set(10)
+        self.conc_slider.set(3)
         self.conc_slider.grid(row=0, column=1, padx=4)
         self.conc_value.grid(row=0, column=2, padx=(0, 12))
 
         ctk.CTkLabel(opts, text="Launch stagger (s):").grid(row=0, column=3, padx=(8, 4))
         self.stagger_entry = ctk.CTkEntry(opts, width=54)
-        self.stagger_entry.insert(0, "1.0")
+        self.stagger_entry.insert(0, "5")
         self.stagger_entry.grid(row=0, column=4, padx=4)
 
         ctk.CTkLabel(opts, text="Keep browser open after submit (s):").grid(row=0, column=5, padx=(8, 4))
@@ -523,6 +523,15 @@ class App(ctk.CTk):
                      ).grid(row=2, column=0, columnspan=8, sticky="w", padx=8)
         self.proxy_box = ctk.CTkTextbox(opts, height=44)
         self.proxy_box.grid(row=3, column=0, columnspan=8, sticky="ew", padx=8, pady=(0, 8))
+
+        ctk.CTkLabel(
+            opts,
+            text=("Avoid getting blocked (single IP, no proxies): keep it gentle - about "
+                  "2-3 concurrent with a 5-8s stagger. If you get blocked/timeouts, drop to "
+                  "1-2 with 10-15s and wait ~15 min. After the first run, saved logins mean "
+                  "far fewer requests."),
+            text_color="#9aa", wraplength=1040, justify="left",
+        ).grid(row=4, column=0, columnspan=8, sticky="w", padx=8, pady=(0, 8))
 
         actions = ctk.CTkFrame(tab, fg_color="transparent")
         actions.grid(row=1, column=0, sticky="ew", padx=PAD)

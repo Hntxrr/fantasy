@@ -97,6 +97,33 @@ built *on* Windows; it can't be cross-compiled from Linux/macOS.)
 | **👁 Watch selected** | Opens a real browser for the selected account (also: double-click a row) so you can watch/verify it. Use when a run isn't active. |
 | **Reset round** | Clears the round for a fresh week — see below. |
 
+### Avoiding rate limits / blocks (no proxies)
+
+All your traffic comes from one IP, so the main lever is **going slower**. The
+**launch stagger** spaces out when each browser *starts* hitting the site, and
+**concurrency** caps how many run at once. Together they set how hard you hit
+the site: with stagger `S` seconds you start roughly one browser every `S`
+seconds (up to `concurrency` at a time).
+
+Suggested settings from a single home IP:
+
+| Situation | Concurrent | Launch stagger |
+|-----------|-----------|----------------|
+| Default / safe | 2–3 | 5–8 s |
+| You already got blocked / timeouts | 1–2 | 10–15 s (and wait ~15 min first) |
+| Never had issues, small batch | 4–5 | 3–4 s |
+
+Extra ways to stay under the radar:
+- **Run in batches** with **Start from account #** (e.g. do 20–30, pause a few
+  minutes, then continue) instead of blasting all at once.
+- After the **first** successful run, logins are saved in each Chrome profile,
+  so later runs skip login = far fewer requests = much less likely to be
+  blocked. Don't delete the profiles.
+- A wave of "site can't be reached" / timeout failures is the signal you're
+  going too fast — lower concurrency, raise the stagger, wait, then use
+  **Retry failed**.
+- Headless vs. visible makes no difference to rate limiting (same requests).
+
 ### What persists (and Reset round)
 
 Everything about the current round is saved and **survives closing the app**:
