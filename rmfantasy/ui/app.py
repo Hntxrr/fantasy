@@ -363,10 +363,18 @@ class App(ctk.CTk):
         right.grid(row=0, column=1, rowspan=4, sticky="nsew", padx=PAD, pady=PAD)
         right.grid_rowconfigure(1, weight=1)
         right.grid_columnconfigure(0, weight=1)
+        header = ctk.CTkFrame(right, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
         self.accounts_count_lbl = ctk.CTkLabel(
-            right, text="Accounts: 0", font=ctk.CTkFont(size=13, weight="bold")
+            header, text="Accounts: 0", font=ctk.CTkFont(size=13, weight="bold")
         )
-        self.accounts_count_lbl.grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        self.accounts_count_lbl.pack(side="left")
+        self.account_search = ctk.CTkEntry(
+            header, placeholder_text="Search email / label...", width=220,
+            fg_color=SURFACE_2, border_color=BORDER,
+        )
+        self.account_search.pack(side="right", padx=(8, 0))
+        self.account_search.bind("<KeyRelease>", lambda e: self.refresh_accounts())
 
         tree_wrap = tk.Frame(right, bg="#242424")
         tree_wrap.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
@@ -475,21 +483,31 @@ class App(ctk.CTk):
     def refresh_accounts(self) -> None:
         for iid in self.accounts_tree.get_children():
             self.accounts_tree.delete(iid)
-        accounts = self.repo.list_accounts()
-        valid_n = 0
-        for acc in accounts:
+        all_accounts = self.repo.list_accounts()
+        valid_n = sum(1 for a in all_accounts if a.session_valid)
+        term = ""
+        if hasattr(self, "account_search"):
+            term = self.account_search.get().strip().casefold()
+        shown = [
+            a for a in all_accounts
+            if not term or term in a.label.casefold() or term in a.email.casefold()
+        ]
+        for acc in shown:
             self.accounts_tree.insert(
                 "", "end", iid=str(acc.id), text=acc.label,
                 values=(acc.email, "valid" if acc.session_valid else "-"),
                 tags=("valid",) if acc.session_valid else ("invalid",),
             )
-            if acc.session_valid:
-                valid_n += 1
         # Valid (logged-in) accounts are listed first, starting at position 1;
         # the rest sit below so you can spot and fix the ones not logged in.
-        self.accounts_count_lbl.configure(
-            text=f"Accounts: {len(accounts)}   ({valid_n} logged in)"
-        )
+        if term:
+            self.accounts_count_lbl.configure(
+                text=f"Showing {len(shown)} of {len(all_accounts)}   ({valid_n} logged in)"
+            )
+        else:
+            self.accounts_count_lbl.configure(
+                text=f"Accounts: {len(all_accounts)}   ({valid_n} logged in)"
+            )
         # Keep the "Start at account" dropdown (This Round tab) in sync.
         self._refresh_start_at_choices()
 
