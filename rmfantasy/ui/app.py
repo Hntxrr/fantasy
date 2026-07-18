@@ -433,6 +433,16 @@ class App(ctk.CTk):
         self._persist_plan()
         self._persist_status()
         self._populate_run_table()
+
+        # Ask which account position to start from (1 = first, default).
+        # This just sets the same "Start from account #" field on Run Picks,
+        # which you can still change there before running.
+        dlg = StartFromDialog(self, max_n=self.plan.assigned_count, default=1)
+        self.wait_window(dlg)
+        start = dlg.result if dlg.result is not None else 1
+        self.start_entry.delete(0, "end")
+        self.start_entry.insert(0, str(start))
+
         warn = ""
         if self.plan.unassigned_pairs:
             warn = f"\n\nWARNING: {len(self.plan.unassigned_pairs)} pairs have no account (need more accounts)."
@@ -440,7 +450,9 @@ class App(ctk.CTk):
             warn += f"\n{len(self.plan.idle_accounts)} accounts will be idle."
         messagebox.showinfo(
             "Plan locked in",
-            f"{self.plan.assigned_count} account submissions ready.{warn}\n\nGo to the 'Run Picks' tab.",
+            f"{self.plan.assigned_count} account submissions ready.\n"
+            f"Run starts at account #{start} - each account submits its own "
+            f"assigned lineup + wildcard.{warn}\n\nGo to the 'Run Picks' tab.",
         )
         self.tabs.set("Run Picks")
 
@@ -516,7 +528,7 @@ class App(ctk.CTk):
         ctk.CTkButton(opts, text="Set from selected row", width=150,
                       command=self.on_set_start_from_selected
                       ).grid(row=1, column=2, columnspan=2, padx=4, pady=(0, 6), sticky="w")
-        ctk.CTkLabel(opts, text="(skips accounts before this position - useful if you already did some)",
+        ctk.CTkLabel(opts, text="(skips rows above this position; each account still submits its own assigned lineup + wildcard)",
                      text_color="#9aa").grid(row=1, column=4, columnspan=4, padx=4, pady=(0, 6), sticky="w")
 
         ctk.CTkLabel(opts, text="Proxies (one host:port per line, optional; round-robin):"
@@ -1055,6 +1067,62 @@ class DisambiguationDialog(ctk.CTkToplevel):
         mapping = {q: combo.get().strip() for q, combo in self.rows.items()}
         self.destroy()
         self.app._apply_aliases(mapping)
+
+
+class StartFromDialog(ctk.CTkToplevel):
+    """Ask which account position the run should start from (1 = first)."""
+
+    def __init__(self, app: "App", max_n: int, default: int = 1):
+        super().__init__(app)
+        self.title("Start from account #")
+        self.geometry("380x210")
+        self.max_n = max(1, max_n)
+        self.result: int | None = default
+        self.transient(app)
+
+        ctk.CTkLabel(
+            self,
+            text=(f"Which account position should the run start from?\n\n"
+                  f"1 = the first account (up to {self.max_n}). Rows above your "
+                  f"number are skipped; every account still submits its own "
+                  f"assigned lineup + wildcard."),
+            wraplength=340, justify="left",
+        ).pack(padx=16, pady=(16, 8))
+
+        self.entry = ctk.CTkEntry(self, width=100, justify="center")
+        self.entry.insert(0, str(default))
+        self.entry.pack(pady=4)
+        self.entry.focus_set()
+        self.entry.select_range(0, "end")
+
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.pack(pady=14)
+        ctk.CTkButton(btns, text="OK", width=90, command=self._ok).pack(side="left", padx=6)
+        ctk.CTkButton(btns, text="Cancel (use 1)", width=110, fg_color="#555555",
+                      hover_color="#666666", command=self._cancel).pack(side="left", padx=6)
+
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self._cancel())
+        # Defer grab until the window is viewable to avoid a grab error.
+        self.after(50, self._safe_grab)
+
+    def _safe_grab(self):
+        try:
+            self.grab_set()
+        except Exception:
+            pass
+
+    def _ok(self):
+        try:
+            v = int(self.entry.get())
+        except ValueError:
+            v = 1
+        self.result = max(1, min(v, self.max_n))
+        self.destroy()
+
+    def _cancel(self):
+        self.result = 1
+        self.destroy()
 
 
 def main() -> None:

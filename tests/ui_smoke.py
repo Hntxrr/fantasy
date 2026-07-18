@@ -83,6 +83,14 @@ restored = app2._run_status.get(first_id)
 print("restart: first account status restored:", restored)
 print("restart: history rows:", len(app2.history_tree.get_children()))
 
+# StartFromDialog: clamps to max and writes an int result (no wait_window here).
+from rmfantasy.ui.app import StartFromDialog
+sd = StartFromDialog(app2, max_n=8, default=1)
+sd.entry.delete(0, "end")
+sd.entry.insert(0, "99")
+sd._ok()
+print("start dialog clamp (expect 8):", sd.result)
+
 # --- Reset round: clears round + history, keeps accounts. ---
 app2.on_reset_round()
 print("after reset: plan:", app2.plan)
