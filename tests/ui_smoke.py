@@ -154,8 +154,8 @@ print("signup failure (expect False):", results["fail2@ex.com"].success)
 print("signup skip existing (expect True):", "skip" in results["user0@ex.com"].message.lower())
 print("accounts delta (expect 1):", app2.repo.count_accounts() - before)
 _accts = {a.email: a for a in app2.repo.list_accounts()}
-# New signups are added but left "not signed in" so they sit at the bottom.
-print("new account NOT signed in (expect False):", _accts["new1@ex.com"].session_valid)
+# Successful signups are marked logged in (the signup saved the session).
+print("new account signed in (expect True):", _accts["new1@ex.com"].session_valid)
 app2._append_signup_file("new1@ex.com", results["new1@ex.com"].password)
 print("signups file has line (expect True):",
       "new1@ex.com" in open(appmod.config.SIGNUPS_PATH).read())

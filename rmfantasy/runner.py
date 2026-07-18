@@ -405,13 +405,13 @@ class SignupRunner:
                         submit_attempts=self.submit_attempts,
                     )
 
-            # Registered and saved to Accounts, but left as "not signed in" so
-            # it appears at the BOTTOM of the list until a real login/pick run
-            # confirms the session (per user preference). The Chrome profile
-            # still holds whatever session the signup created.
-            status("Registered - added to Accounts (not signed in).")
+            # Signup logs you in on the site, and that session is saved in the
+            # account's Chrome profile -> mark it logged in so you don't have to
+            # sign in again. Later pick runs reuse the saved session.
+            repo.set_session_valid(account.id, True)
+            status("Registered and logged in - saved to Accounts.")
             return SignupResult(
-                email, True, "Registered - added to Accounts (not signed in).",
+                email, True, "Registered and logged in.",
                 password=profile.password, account_id=account.id,
             )
         except SignupError as exc:
