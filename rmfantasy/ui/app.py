@@ -709,7 +709,9 @@ class App(ctk.CTk):
             if not messagebox.askyesno(
                 "No selection",
                 f"No accounts are selected. Check ALL {total} accounts?\n\n"
-                f"(Select specific accounts first to check only those.)",
+                f"This loads each account's page to verify the login (accurate), "
+                f"so it can take a while for many accounts. Tip: select just the "
+                f"accounts you care about to check only those.",
             ):
                 return
             ids = [a.id for a in self.repo.list_accounts()]
@@ -718,10 +720,13 @@ class App(ctk.CTk):
         self.refresh_logins_btn.configure(state="disabled", text="Checking...")
         self.open_chrome_btn.configure(state="disabled")
         self.refresh_stop_btn.configure(state="normal", text="Stop")
-        self.accounts_status.configure(text=f"Quick login check (reading cookies)... 0/{len(ids)}")
-        # Fast mode reads each profile's saved cookies directly -- no browser
-        # launch, so 400+ accounts check in seconds instead of forever.
-        self.signin_runner = VerifyRunner(ids, concurrency=8, fast=True)
+        self.accounts_status.configure(
+            text=f"Checking login (loading each page - accurate but slower)... 0/{len(ids)}"
+        )
+        # Accurate check: actually loads each profile's page (headless) and looks
+        # for the logged-in vs guest state. Slower than reading cookies, but a
+        # saved cookie doesn't prove a live login -- only loading the page does.
+        self.signin_runner = VerifyRunner(ids, concurrency=6, fast=False)
         self.signin_thread = threading.Thread(target=self._refresh_logins_worker, args=(ids,), daemon=True)
         self.signin_thread.start()
 
@@ -2100,7 +2105,7 @@ class App(ctk.CTk):
         elif kind == "si_result":
             self.refresh_accounts()
         elif kind == "si_progress":
-            self.accounts_status.configure(text=f"Checking login status... {evt[1]}/{evt[2]}")
+            self.accounts_status.configure(text=f"Verifying logins... {evt[1]}/{evt[2]}")
         elif kind == "si_done":
             self.refresh_logins_btn.configure(state="normal", text="Refresh login status")
             self.open_chrome_btn.configure(state="normal")
