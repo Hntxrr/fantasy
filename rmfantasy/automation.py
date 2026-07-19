@@ -833,18 +833,74 @@ def do_login(driver, email: str, password: str, timeout: int = 30) -> None:
     except TimeoutException as exc:
         raise LoginRequired("Login modal / email field did not appear.") from exc
 
-    email_el = driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS)
-    pwd_el = driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_PASSWORD_CSS)
-    _fill_element(driver, email_el, email)   # stale-resistant fill
-    _fill_element(driver, pwd_el, password)
+    # The login form fires a Wicket AJAX refresh once the email is complete
+    # (you see it "reload at the last character"). That refresh re-renders and
+    # staleifies the password field, so filling both up front loses the
+    # password. Fix: fill the email, let that ONE refresh land, then RE-FIND the
+    # password field on the settled DOM before filling it.
+    def _fill_login_fields() -> None:
+        email_el = WebDriverWait(driver, timeout).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS))
+        )
+        try:
+            marker = driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_PASSWORD_CSS)
+        except NoSuchElementException:
+            marker = None
+
+        _fill_element(driver, email_el, email)
+        # Nudge the change/blur so the refresh happens NOW (not later, while we
+        # are in the password field).
+        try:
+            driver.execute_script(
+                "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));"
+                "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));",
+                email_el,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Wait for that refresh to actually land (old password node goes stale).
+        if marker is not None:
+            try:
+                WebDriverWait(driver, 6).until(EC.staleness_of(marker))
+            except TimeoutException:
+                pass  # no refresh (or already done) -- fine
+
+        # Fill the password on the fresh, post-refresh DOM.
+        pwd = WebDriverWait(driver, timeout).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, selectors.LOGIN_PASSWORD_CSS))
+        )
+        _fill_element(driver, pwd, password)
+
+        # If the refresh wiped the email, put it back (JS value, no new refresh).
+        try:
+            em = driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS)
+            if not (em.get_attribute("value") or "").strip():
+                driver.execute_script(
+                    "arguments[0].value=arguments[1];"
+                    "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));",
+                    em, email,
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+    for _ in range(3):
+        try:
+            _fill_login_fields()
+            break
+        except StaleElementReferenceException:
+            time.sleep(0.5)
 
     # Submit: prefer an explicit submit button; fall back to button text.
     submit = _find_first_visible(driver, [selectors.LOGIN_SUBMIT_CSS])
     if submit is not None:
         _click(driver, submit)
     elif not _click_by_text(driver, selectors.LOGIN_SUBMIT_TEXTS):
-        # Last resort: submit the form via the password field.
-        pwd_el.submit()
+        # Last resort: submit the form via a fresh password field.
+        try:
+            driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_PASSWORD_CSS).submit()
+        except Exception:  # noqa: BLE001
+            pass
 
     # Success == modal closes OR rider dropdowns become enabled.
     try:
