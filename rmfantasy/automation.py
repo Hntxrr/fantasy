@@ -138,18 +138,12 @@ def _chrome_options(profile_dir: str, headless: bool) -> Options:
     opts.add_argument("--window-size=1200,860")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
-    # Trim each browser's footprint so hundreds of runs don't exhaust the
-    # machine's memory / window handles (the cause of the ~400-browsers wall).
-    for flag in (
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-background-networking",
-        "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-renderer-backgrounding",
-        "--disable-features=Translate,MediaRouter,OptimizationHints",
-    ):
-        opts.add_argument(flag)
+    # NOTE: no footprint-trimming flags here. An earlier attempt added
+    # --disable-background-networking / --disable-features / etc. to fight the
+    # ~400-browser wall, but those altered how the site's JS ran and broke the
+    # picks submit. The real wall fix is reaping the Chrome process tree in
+    # _hard_close, so the browser stays byte-for-byte the one that submitted
+    # fine before. Do NOT re-add page-affecting flags here.
     # Suppress Chrome's "Save password?" and "Save address?" bubbles -- they're
     # browser UI that covers the in-page 'Account created' panel, forcing extra
     # clicks. Turning them off lets you just create/log in and hit the button.
@@ -1466,6 +1460,102 @@ def dump_signup_form(driver) -> str:
             )
         except Exception:  # noqa: BLE001
             continue
+    return "\n".join(lines)
+
+
+def dump_picks_page(driver) -> str:
+    """Detailed dump of the LOGGED-IN picks page: login state, rider dropdowns,
+    every visible button/link, and how our submit + success selectors match.
+
+    Used by the 'Debug picks' button so the exact Submit-button markup and the
+    confirmation text can be shared and the pick selectors set precisely.
+    """
+    lines: list[str] = []
+    try:
+        lines.append(f"URL: {driver.current_url}")
+        lines.append(f"TITLE: {driver.title}")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        lines.append(f"is_logged_in(): {is_logged_in(driver)}")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"is_logged_in() raised: {exc}")
+
+    lines.append("")
+    lines.append("=== RIDER DROPDOWNS (<select> with 10+ options) ===")
+    try:
+        selects = find_rider_selects(driver)
+        lines.append(f"count={len(selects)} (expected {selectors.EXPECTED_RIDER_SELECTS})")
+        for i, s in enumerate(selects):
+            try:
+                opts = _option_names(s)
+                sample = list(opts.values())[:4]
+                lines.append(
+                    f"  select[{i}] enabled={s.is_enabled()} options={len(opts)} sample={sample}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"  select[{i}] read failed: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"find_rider_selects raised: {exc}")
+
+    lines.append("")
+    lines.append("=== BUTTONS / CLICKABLES ===")
+    for tag in ("button", "input", "a"):
+        try:
+            elements = driver.find_elements(By.TAG_NAME, tag)
+        except Exception:  # noqa: BLE001
+            continue
+        for el in elements:
+            try:
+                if not el.is_displayed():
+                    continue
+                typ = (el.get_attribute("type") or "").strip()
+                if tag == "input" and typ not in ("submit", "button", "image", ""):
+                    continue
+                txt = " ".join(((el.get_attribute("value") if tag == "input" else el.text) or "").split())
+                oh = " ".join((el.get_attribute("outerHTML") or "").split())[:240]
+                lines.append(
+                    f"<{tag}> type={typ or '-'} enabled={el.is_enabled()} "
+                    f"class={el.get_attribute('class') or ''!r} text={txt!r}"
+                )
+                lines.append(f"    {oh}")
+            except Exception:  # noqa: BLE001
+                continue
+
+    lines.append("")
+    lines.append("=== HOW OUR SUBMIT SELECTORS MATCH ===")
+    for text in selectors.SUBMIT_PICKS_BUTTON_TEXTS:
+        try:
+            xp = (
+                f"//button[normalize-space()='{text}'] | "
+                f"//a[normalize-space()='{text}'] | "
+                f"//input[(@type='submit' or @type='button') and @value='{text}']"
+            )
+            found = [e for e in driver.find_elements(By.XPATH, xp)
+                     if e.is_displayed() and e.is_enabled()]
+            lines.append(f"  text {text!r}: {len(found)} visible+enabled match(es)")
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"  text {text!r}: error {exc}")
+    try:
+        css_el = _find_first_visible(driver, [selectors.SUBMIT_PICKS_BUTTON_CSS])
+        lines.append(f"  CSS {selectors.SUBMIT_PICKS_BUTTON_CSS!r}: {'FOUND' if css_el else 'none'}")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"  CSS match error: {exc}")
+
+    lines.append("")
+    lines.append("=== SUCCESS / CONFIRMATION MARKERS ON PAGE NOW ===")
+    try:
+        css_hit = _find_first_visible(driver, selectors.SUBMIT_SUCCESS_CSS)
+        lines.append(f"  success CSS present: {'YES' if css_hit else 'no'}")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        body = driver.find_element(By.TAG_NAME, "body").text.casefold()
+        hits = [t for t in selectors.SUBMIT_SUCCESS_TEXT_CONTAINS if t in body]
+        lines.append(f"  success phrases present: {hits or 'none'}")
+    except Exception:  # noqa: BLE001
+        pass
+
     return "\n".join(lines)
 
 

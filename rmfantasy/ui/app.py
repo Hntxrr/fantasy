@@ -562,6 +562,11 @@ class App(ctk.CTk):
             signin_btns2, text="Mark selected as NOT logged in", fg_color=NEUTRAL,
             hover_color=NEUTRAL_HOV, command=self.on_mark_logged_out,
         ).pack(side="left", padx=4)
+        self.debug_picks_btn = ctk.CTkButton(
+            signin_btns2, text="Debug picks", fg_color=NEUTRAL,
+            hover_color=NEUTRAL_HOV, command=self.on_debug_picks,
+        )
+        self.debug_picks_btn.pack(side="left", padx=4)
         ctk.CTkLabel(
             right,
             text=("Tip: 'Log in selected (auto-fill)' fills each login for you - clear the "
@@ -693,6 +698,43 @@ class App(ctk.CTk):
                 return
             time.sleep(1.5)  # small gap so the windows open cleanly
         self.events.put(("chrome_opened", len(targets)))
+
+    def on_debug_picks(self) -> None:
+        """Open ONE selected account's picks page and dump it to a file so the
+        exact Submit button + confirmation markup can be shared."""
+        ids = self._selected_account_ids()
+        if not ids:
+            messagebox.showinfo(
+                "No selection",
+                "Select ONE logged-in account, then click 'Debug picks' to dump "
+                "its picks page (buttons, dropdowns, submit + success markers).",
+            )
+            return
+        acc = self.repo.get_account(ids[0], include_password=True)
+        if acc is None:
+            return
+        self.debug_picks_btn.configure(state="disabled", text="Dumping...")
+        self.accounts_status.configure(text="Opening the picks page to dump it...")
+        threading.Thread(
+            target=self._debug_picks_worker, args=(acc.profile_dir,), daemon=True
+        ).start()
+
+    def _debug_picks_worker(self, profile_dir) -> None:
+        try:
+            driver = automation.build_driver(profile_dir, headless=False)
+            try:
+                driver.get(config.BASE_URL)
+                time.sleep(2.0)
+                report = automation.dump_picks_page(driver)
+            finally:
+                automation._hard_close(driver)
+            config.ensure_dirs()
+            path = config.APP_DIR / "picks_page_debug.txt"
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(report)
+            self.events.put(("picks_dump", str(path), report))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("picks_dump_err", str(exc)))
 
     def on_refresh_logins(self) -> None:
         """Check which SELECTED accounts have a live session and mark them valid.
@@ -2079,6 +2121,21 @@ class App(ctk.CTk):
             self.debug_form_btn.configure(state="normal", text="Debug form")
             self.signup_status_lbl.configure(text="Form dump failed.")
             messagebox.showerror("Debug form failed", str(evt[1]))
+        elif kind == "picks_dump":
+            self.debug_picks_btn.configure(state="normal", text="Debug picks")
+            path, report = evt[1], evt[2]
+            self.accounts_status.configure(text=f"Picks page dump written to: {path}")
+            head = report[:1500] + ("\n... (full dump in the file above)" if len(report) > 1500 else "")
+            messagebox.showinfo(
+                "Picks page dump",
+                f"Saved the picks page's login state, dropdowns, buttons, and "
+                f"submit/success markers to:\n{path}\n\nOpen that file and share it "
+                f"with me.\n\n{head}",
+            )
+        elif kind == "picks_dump_err":
+            self.debug_picks_btn.configure(state="normal", text="Debug picks")
+            self.accounts_status.configure(text="Picks page dump failed.")
+            messagebox.showerror("Debug picks failed", str(evt[1]))
         elif kind == "sl_status":
             acc = self.repo.get_account(evt[1], include_password=False)
             label = acc.label if acc else f"#{evt[1]}"
