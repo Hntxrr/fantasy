@@ -1005,14 +1005,60 @@ def _select_rider(select_el, rider: str) -> None:
     Select(select_el).select_by_visible_text(options[key])
 
 
-def _select_rider(select_el, rider: str) -> None:
-    options = _option_names(select_el)
-    key = _norm(rider)
-    if key not in options:
-        raise EligibilityError([rider])
-    # select_by_visible_text picks the first occurrence (featured section) when
-    # a rider is listed twice -- which is exactly what we want.
-    Select(select_el).select_by_visible_text(options[key])
+def wait_for_wicket_ajax(driver, timeout: float = 15.0) -> None:
+    """Block until this site's Wicket AJAX has finished re-rendering the form.
+
+    The pick page re-renders over AJAX on every dropdown change and on submit.
+    Acting before that settles means the server never records the change -- the
+    selection (or the whole submit) is silently lost and the page 'refreshes'.
+    We detect activity via Wicket.Ajax.isBusy() when available, and fall back to
+    the visibility of the page's #AjaxIndicator element.
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            busy = driver.execute_script(
+                "try {"
+                "  if (window.Wicket && Wicket.Ajax && typeof Wicket.Ajax.isBusy === 'function')"
+                "    return !!Wicket.Ajax.isBusy();"
+                "  var ind = document.getElementById('AjaxIndicator');"
+                "  if (ind) return ind.offsetParent !== null;"
+                "  return false;"
+                "} catch (e) { return false; }"
+            )
+        except Exception:  # noqa: BLE001
+            busy = False
+        if not busy:
+            return
+        time.sleep(0.15)
+
+
+def _select_rider_at(driver, index: int, rider: str, attempts: int = 4) -> None:
+    """Select a rider in dropdown ``index``, re-finding the dropdowns each try
+    and waiting for the Wicket AJAX re-render to settle afterwards.
+
+    Selecting a rider triggers a Wicket AJAX refresh that REPLACES the other
+    dropdown elements, so we must re-find them before each pick (a reference
+    grabbed up front goes stale) and let the server record the change before
+    moving on -- otherwise the pick is lost.
+    """
+    last: Exception | None = None
+    for _ in range(max(1, attempts)):
+        try:
+            selects = find_rider_selects(driver)
+            if index >= len(selects):
+                raise SubmissionError(
+                    f"Rider dropdown #{index + 1} not found ({len(selects)} present)."
+                )
+            _select_rider(selects[index], rider)
+            wait_for_wicket_ajax(driver)  # let the server record this pick
+            return
+        except StaleElementReferenceException as exc:
+            last = exc
+            wait_for_wicket_ajax(driver)  # re-render in flight; wait, then re-find
+    raise SubmissionError(
+        f"Could not set rider '{rider}' - the form kept re-rendering."
+    ) from last
 
 
 def select_all_riders(driver, request: PickRequest) -> None:
@@ -1020,9 +1066,13 @@ def select_all_riders(driver, request: PickRequest) -> None:
     missing = check_eligibility(selects, request)
     if missing:
         raise EligibilityError(missing)
+    # Re-find + settle before each pick, since selecting one re-renders the rest
+    # (Wicket AJAX). Sequential set-by-index on stale references silently drops
+    # picks, which is what makes the submit 'refresh' with nothing saved.
     for idx, rider in enumerate(request.core_five):
-        _select_rider(selects[idx], rider)
-    _select_rider(selects[selectors.WILDCARD_SELECT_INDEX], request.wildcard)
+        _select_rider_at(driver, idx, rider)
+    _select_rider_at(driver, selectors.WILDCARD_SELECT_INDEX, request.wildcard)
+    wait_for_wicket_ajax(driver)  # make sure the last pick is recorded
 
 
 def click_submit(driver) -> None:
@@ -1067,11 +1117,21 @@ def submit_picks(
     if status_cb:
         status_cb("Submitting...")
     click_submit(driver)
+    wait_for_wicket_ajax(driver)  # let the submit AJAX finish before checking
 
     if not verify:
         return
     if status_cb:
         status_cb("Confirming...")
+    # If the submit bounced the page to a logged-out state, it did NOT save --
+    # this is the "refresh that eats the picks" on accounts whose session wasn't
+    # truly established.
+    if not is_logged_in(driver):
+        raise SubmissionError(
+            "The page reset to a logged-out state right after submitting, so the "
+            "picks were not saved. Log this account in first (its session wasn't "
+            "fully established), then retry."
+        )
     if not confirm_success(driver):
         raise SubmissionError(
             "Submitted but no confirmation detected. Verify SUBMIT_SUCCESS_* "
