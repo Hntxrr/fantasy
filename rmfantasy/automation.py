@@ -764,33 +764,61 @@ def do_login(driver, email: str, password: str, timeout: int = 30) -> None:
     except TimeoutException as exc:
         raise LoginRequired("Login modal / email field did not appear.") from exc
 
-    # The site AJAX-refreshes the login form once the email changes, which
-    # re-renders (and staleifies) the password field. So: fill the email, let
-    # that refresh settle, then RE-FIND the password field before filling it.
+    # The site fires a Wicket AJAX refresh when the EMAIL field changes, which
+    # re-renders (and staleifies) the password field. Two things matter:
+    #   1) Set the email in ONE shot via JS. send_keys types char-by-char, and
+    #      because the field also listens on keyup/input, that fires a refresh
+    #      on EVERY keystroke -- a refresh storm that wipes the field mid-type.
+    #      One JS assignment + a single change event = exactly one refresh.
+    #   2) After that single change, WAIT for the refresh to actually land (the
+    #      old password node goes stale) before re-finding + filling password
+    #      on the settled DOM.
     def _fill_login_fields() -> None:
-        WebDriverWait(driver, timeout).until(
-            EC.visibility_of_element_located((By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS))
+        email_el = WebDriverWait(driver, timeout).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS))
         )
-        _fill_element(driver, driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS), email)
-        time.sleep(1.3)  # allow the email-triggered form refresh to complete
-        WebDriverWait(driver, timeout).until(
-            EC.visibility_of_element_located((By.CSS_SELECTOR, selectors.LOGIN_PASSWORD_CSS))
-        )
-        _fill_element(driver, driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_PASSWORD_CSS), password)
-        # If the refresh wiped the email, put it back.
+        # Grab a node the refresh will replace, so we can detect it completed.
         try:
-            em = driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS)
-            if not (em.get_attribute("value") or "").strip():
-                _fill_element(driver, em, email)
-        except Exception:  # noqa: BLE001
-            pass
+            marker = driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_PASSWORD_CSS)
+        except NoSuchElementException:
+            marker = None
 
-    for _ in range(3):
+        _set_input_value(driver, email_el, email)  # one-shot value + one change
+
+        # Wait for the email-triggered refresh to land, then let it settle.
+        if marker is not None:
+            try:
+                WebDriverWait(driver, 8).until(EC.staleness_of(marker))
+            except TimeoutException:
+                pass  # no refresh happened (or already finished) -- that's fine
+        time.sleep(0.4)  # give the re-rendered fields a beat to attach handlers
+
+        # Fill the password on the fresh (post-refresh) DOM.
+        pwd = WebDriverWait(driver, timeout).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, selectors.LOGIN_PASSWORD_CSS))
+        )
+        _set_input_value(driver, pwd, password)
+
+        # Restore the email if the refresh cleared it -- via JS value only, so
+        # we don't kick off yet another change/refresh cycle.
+        em = driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS)
+        if not (em.get_attribute("value") or "").strip():
+            driver.execute_script(
+                "arguments[0].value=arguments[1];"
+                "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));",
+                em, email,
+            )
+        # A late refresh can wipe the password after we set it -> force a retry.
+        pwd = driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_PASSWORD_CSS)
+        if not (pwd.get_attribute("value") or "").strip():
+            raise StaleElementReferenceException("password cleared by a late form refresh")
+
+    for _ in range(4):
         try:
             _fill_login_fields()
             break
         except StaleElementReferenceException:
-            time.sleep(0.5)
+            time.sleep(0.6)
 
     # Submit: re-find fresh (the form may have re-rendered again).
     submit = _find_first_visible(driver, [selectors.LOGIN_SUBMIT_CSS])
@@ -1014,6 +1042,26 @@ def _find_input_by_placeholder(scope, placeholder_substrings):
         if ph and any(s in ph for s in subs):
             return el
     return None
+
+
+def _set_input_value(driver, el, value: str) -> None:
+    """Set an input's value in a SINGLE shot, then fire the events frameworks
+    listen for.
+
+    Unlike ``send_keys`` (which types character-by-character and, on a field
+    with a keyup/input AJAX handler, triggers a form refresh on every keystroke),
+    this assigns the whole value at once so at most ONE change/refresh fires.
+    Raises on a stale element so the caller can retry on the re-rendered DOM.
+    """
+    driver.execute_script(
+        "arguments[0].focus();"
+        "arguments[0].value='';"
+        "arguments[0].value=arguments[1];"
+        "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
+        "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));"
+        "arguments[0].dispatchEvent(new Event('blur',{bubbles:true}));",
+        el, value,
+    )
 
 
 def _fill_element(driver, el, value: str) -> None:
