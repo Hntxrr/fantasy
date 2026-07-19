@@ -68,6 +68,11 @@ class LoginRequired(AutomationError):
     """Raised when an authenticated session could not be established."""
 
 
+class NotLoggedIn(AutomationError):
+    """Raised (during picks) when an account isn't logged in and we won't try to
+    auto-login it (the site's captcha blocks that). The user must log it in first."""
+
+
 class EligibilityError(AutomationError):
     """Raised when one or more riders are not selectable (out/injured/ineligible)."""
 
@@ -705,10 +710,8 @@ def do_login(driver, email: str, password: str, timeout: int = 30) -> None:
 
     email_el = driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS)
     pwd_el = driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_PASSWORD_CSS)
-    email_el.clear()
-    email_el.send_keys(email)
-    pwd_el.clear()
-    pwd_el.send_keys(password)
+    _fill_element(driver, email_el, email)   # stale-resistant fill
+    _fill_element(driver, pwd_el, password)
 
     # Submit: prefer an explicit submit button; fall back to button text.
     submit = _find_first_visible(driver, [selectors.LOGIN_SUBMIT_CSS])
@@ -751,15 +754,33 @@ def ensure_logged_in(
     password: str,
     login_timeout: int = 30,
     status_cb: Optional[StatusCallback] = None,
+    attempt_login: bool = True,
 ) -> None:
-    """Guarantee an authenticated session (reuse saved session, else log in)."""
+    """Guarantee an authenticated session (reuse saved session, else log in).
+
+    With ``attempt_login=False`` (used for picks) it will NOT try to auto-login
+    a logged-out account -- the site's captcha blocks that -- and instead raises
+    :class:`NotLoggedIn` with a clear message telling you to log it in first.
+    """
     driver.get(config.BASE_URL)
     WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
-    if is_logged_in(driver):
+    # Give a saved session a few seconds to render the (editable) pick form
+    # before deciding it's logged out (avoids false negatives on slow loads).
+    try:
+        WebDriverWait(driver, 8).until(lambda d: is_logged_in(d))
         if status_cb:
             status_cb("Already logged in (reused session).")
         return
+    except TimeoutException:
+        pass
+
+    if not attempt_login:
+        raise NotLoggedIn(
+            "Not logged in - log this account in first (Accounts tab: 'Log in "
+            "selected' or 'Open selected in Chrome'), then Retry. The site's "
+            "captcha blocks automatic login during picks."
+        )
 
     if status_cb:
         status_cb("Logging in...")
