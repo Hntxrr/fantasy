@@ -520,7 +520,18 @@ def wait_until_any(driver, predicates: Iterable[Callable], timeout: float = 20, 
 
 
 def _visible_elements(driver, css: str):
-    return [el for el in driver.find_elements(By.CSS_SELECTOR, css) if el.is_displayed()]
+    out = []
+    try:
+        els = driver.find_elements(By.CSS_SELECTOR, css)
+    except Exception:  # noqa: BLE001
+        return out
+    for el in els:
+        try:
+            if el.is_displayed():
+                out.append(el)
+        except StaleElementReferenceException:
+            continue
+    return out
 
 
 def _find_first_visible(driver, css_list: Iterable[str]):
@@ -800,14 +811,41 @@ def _select_rider(select_el, rider: str) -> None:
     Select(select_el).select_by_visible_text(options[key])
 
 
+def _select_rider_at(driver, index: int, rider: str, attempts: int = 4) -> None:
+    """Select a rider in dropdown ``index``, re-finding the dropdowns each try.
+
+    Picking a rider triggers an AJAX refresh that re-renders the other
+    dropdowns, so a reference grabbed earlier goes stale. Re-finding before each
+    (re)try makes the selection resilient to that.
+    """
+    last: Exception | None = None
+    for _ in range(max(1, attempts)):
+        try:
+            selects = find_rider_selects(driver)
+            if index >= len(selects):
+                raise SubmissionError(
+                    f"Rider dropdown #{index + 1} not found ({len(selects)} present)."
+                )
+            _select_rider(selects[index], rider)
+            return
+        except StaleElementReferenceException as exc:
+            last = exc
+            time.sleep(0.4)  # let the AJAX re-render settle, then re-find
+    raise SubmissionError(
+        f"Could not set rider '{rider}' - the dropdowns kept refreshing."
+    ) from last
+
+
 def select_all_riders(driver, request: PickRequest) -> None:
     selects = find_rider_selects(driver)
     missing = check_eligibility(selects, request)
     if missing:
         raise EligibilityError(missing)
+    # Re-find the dropdowns before each pick, since selecting one re-renders the
+    # rest (Wicket AJAX) and would otherwise leave stale references.
     for idx, rider in enumerate(request.core_five):
-        _select_rider(selects[idx], rider)
-    _select_rider(selects[selectors.WILDCARD_SELECT_INDEX], request.wildcard)
+        _select_rider_at(driver, idx, rider)
+    _select_rider_at(driver, selectors.WILDCARD_SELECT_INDEX, request.wildcard)
 
 
 def click_submit(driver) -> None:

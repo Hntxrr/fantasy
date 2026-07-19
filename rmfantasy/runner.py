@@ -29,6 +29,8 @@ from typing import Callable, Optional
 
 from . import automation
 from .assignment import RoundAssignment
+from selenium.common.exceptions import StaleElementReferenceException
+
 from .automation import (
     AutomationError,
     EligibilityError,
@@ -182,7 +184,8 @@ class ConcurrentRunner:
                 except EligibilityError as exc:
                     # Permanent for this round -- do not retry.
                     return self._finish(assignment, False, str(exc), repo)
-                except (LoginRequired, SubmissionError, AutomationError) as exc:
+                except (LoginRequired, SubmissionError, AutomationError,
+                        StaleElementReferenceException) as exc:
                     last_error = exc
                     status(f"Attempt {attempt}/{self.submit_retries} failed: {exc}")
                     if attempt < self.submit_retries:
