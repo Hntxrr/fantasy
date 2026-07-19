@@ -603,6 +603,73 @@ def _hard_close(driver) -> None:
             pass
 
 
+# Chrome profile subdirectories that are pure CACHE -- safe to delete (Chrome
+# recreates them; they NEVER hold cookies/login/session). Pruning these keeps
+# disk usage flat over a long run. We deliberately do NOT touch Cookies,
+# "Network/Cookies", "Login Data", "Local Storage", "Session Storage", etc.
+_PROFILE_CACHE_SUBDIRS = (
+    "Default/Cache",
+    "Default/Code Cache",
+    "Default/GPUCache",
+    "Default/DawnGraphiteCache",
+    "Default/DawnWebGPUCache",
+    "Default/GrShaderCache",
+    "Default/Service Worker/CacheStorage",
+    "Default/Service Worker/ScriptCache",
+    "GPUCache",
+    "GrShaderCache",
+    "ShaderCache",
+    "component_crx_cache",
+    "extensions_crx_cache",
+)
+
+
+def _prune_profile_cache(profile_dir: str, measure: bool = False) -> int:
+    """Delete a profile's regenerable CACHE dirs (never cookies/login/session).
+
+    Chrome caches balloon over a long run and fill the disk; once the disk is
+    nearly full, later browsers can't write their profile -> pages don't load,
+    sessions don't save, picks 'refresh' and fail. Returns bytes freed when
+    ``measure`` is set (skip measuring on the hot path -- it's slower).
+    """
+    freed = 0
+    try:
+        base = Path(profile_dir)
+        if not base.exists():
+            return 0
+    except Exception:  # noqa: BLE001
+        return 0
+    for rel in _PROFILE_CACHE_SUBDIRS:
+        target = base / rel
+        if not target.exists():
+            continue
+        if measure:
+            try:
+                freed += sum(f.stat().st_size for f in target.rglob("*") if f.is_file())
+            except Exception:  # noqa: BLE001
+                pass
+        shutil.rmtree(target, ignore_errors=True)
+    return freed
+
+
+def prune_all_profile_caches() -> tuple[int, int]:
+    """Prune caches from EVERY Chrome profile on disk.
+
+    Returns ``(profiles_processed, bytes_freed)``. Use this to reclaim disk from
+    a big backlog of profiles without losing any logins.
+    """
+    root = config.CHROME_PROFILES_DIR
+    if not root.exists():
+        return (0, 0)
+    total_freed = 0
+    count = 0
+    for child in sorted(root.iterdir()):
+        if child.is_dir():
+            total_freed += _prune_profile_cache(str(child), measure=True)
+            count += 1
+    return (count, total_freed)
+
+
 @contextmanager
 def chrome_session(profile_dir: str, headless: bool = False, proxy: Optional[str] = None):
     driver = build_driver(profile_dir, headless=headless, proxy=proxy)
@@ -610,6 +677,12 @@ def chrome_session(profile_dir: str, headless: bool = False, proxy: Optional[str
         yield driver
     finally:
         _hard_close(driver)
+        # Keep disk usage flat across a long run: drop this profile's caches
+        # (the session/cookies are preserved) so we never fill the drive.
+        try:
+            _prune_profile_cache(profile_dir)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # --------------------------------------------------------------------------- #

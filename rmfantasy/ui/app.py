@@ -567,6 +567,11 @@ class App(ctk.CTk):
             hover_color=NEUTRAL_HOV, command=self.on_debug_picks,
         )
         self.debug_picks_btn.pack(side="left", padx=4)
+        self.free_disk_btn = ctk.CTkButton(
+            signin_btns2, text="Free up disk (clear caches)", fg_color=NEUTRAL,
+            hover_color=NEUTRAL_HOV, command=self.on_free_disk,
+        )
+        self.free_disk_btn.pack(side="left", padx=4)
         ctk.CTkLabel(
             right,
             text=("Tip: 'Log in selected (auto-fill)' fills each login for you - clear the "
@@ -698,6 +703,27 @@ class App(ctk.CTk):
                 return
             time.sleep(1.5)  # small gap so the windows open cleanly
         self.events.put(("chrome_opened", len(targets)))
+
+    def on_free_disk(self) -> None:
+        """Clear regenerable Chrome caches from every profile to reclaim disk
+        space (logins/sessions are preserved)."""
+        if not messagebox.askyesno(
+            "Free up disk space",
+            "Clear the browser CACHE from all Chrome profiles?\n\n"
+            "This reclaims disk space and does NOT log anyone out (cookies and "
+            "sessions are kept). Chrome just rebuilds the cache next time.",
+        ):
+            return
+        self.free_disk_btn.configure(state="disabled", text="Clearing...")
+        self.accounts_status.configure(text="Clearing browser caches...")
+        threading.Thread(target=self._free_disk_worker, daemon=True).start()
+
+    def _free_disk_worker(self) -> None:
+        try:
+            count, freed = automation.prune_all_profile_caches()
+            self.events.put(("free_disk_done", count, freed))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("free_disk_err", str(exc)))
 
     def on_debug_picks(self) -> None:
         """Open ONE selected account's picks page and dump it to a file so the
@@ -2136,6 +2162,25 @@ class App(ctk.CTk):
             self.debug_picks_btn.configure(state="normal", text="Debug picks")
             self.accounts_status.configure(text="Picks page dump failed.")
             messagebox.showerror("Debug picks failed", str(evt[1]))
+        elif kind == "free_disk_done":
+            self.free_disk_btn.configure(state="normal", text="Free up disk (clear caches)")
+            count, freed = evt[1], evt[2]
+            mb = freed / (1024 * 1024)
+            gb = mb / 1024
+            human = f"{gb:.2f} GB" if mb >= 1024 else f"{mb:.0f} MB"
+            self.accounts_status.configure(
+                text=f"Cleared caches from {count} profile(s) - freed {human}."
+            )
+            messagebox.showinfo(
+                "Disk freed",
+                f"Cleared browser caches from {count} profile(s) and freed about "
+                f"{human}.\n\nNo one was logged out - Chrome will rebuild the cache "
+                f"as needed.",
+            )
+        elif kind == "free_disk_err":
+            self.free_disk_btn.configure(state="normal", text="Free up disk (clear caches)")
+            self.accounts_status.configure(text="Clearing caches failed.")
+            messagebox.showerror("Free up disk failed", str(evt[1]))
         elif kind == "sl_status":
             acc = self.repo.get_account(evt[1], include_password=False)
             label = acc.label if acc else f"#{evt[1]}"
