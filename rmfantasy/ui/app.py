@@ -572,6 +572,11 @@ class App(ctk.CTk):
             hover_color=NEUTRAL_HOV, command=self.on_free_disk,
         )
         self.free_disk_btn.pack(side="left", padx=4)
+        self.reset_profile_btn = ctk.CTkButton(
+            signin_btns2, text="Reset profile (fresh login)", fg_color=NEUTRAL,
+            hover_color=NEUTRAL_HOV, command=self.on_reset_profiles,
+        )
+        self.reset_profile_btn.pack(side="left", padx=4)
         ctk.CTkLabel(
             right,
             text=("Tip: 'Log in selected (auto-fill)' fills each login for you - clear the "
@@ -703,6 +708,46 @@ class App(ctk.CTk):
                 return
             time.sleep(1.5)  # small gap so the windows open cleanly
         self.events.put(("chrome_opened", len(targets)))
+
+    def on_reset_profiles(self) -> None:
+        """Wipe the Chrome profile(s) for the selected account(s) so they start
+        fresh (fixes accounts whose saved session went stale)."""
+        ids = self._selected_account_ids()
+        if not ids:
+            messagebox.showinfo(
+                "No selection",
+                "Select the account(s) whose profile you want to reset "
+                "(the ones that fail with a refresh).",
+            )
+            return
+        if not messagebox.askyesno(
+            "Reset profile(s)",
+            f"Wipe the Chrome profile for {len(ids)} account(s) and mark them as "
+            "logged out?\n\nThis deletes their saved browser session so the next "
+            "login is completely fresh (like a brand-new browser). It's the fix "
+            "for accounts that show green but refresh/fail on submit. You'll "
+            "re-log-in these accounts afterward (Open in Chrome / auto-fill).",
+        ):
+            return
+        targets = []
+        for i in ids:
+            acc = self.repo.get_account(i, include_password=False)
+            if acc is not None:
+                targets.append((i, acc.profile_dir))
+        self.reset_profile_btn.configure(state="disabled", text="Resetting...")
+        self.accounts_status.configure(text=f"Resetting {len(targets)} profile(s)...")
+        threading.Thread(target=self._reset_profiles_worker, args=(targets,), daemon=True).start()
+
+    def _reset_profiles_worker(self, targets) -> None:
+        done = 0
+        for acc_id, profile_dir in targets:
+            try:
+                automation.reset_profile(profile_dir)
+                self.repo.set_session_valid(acc_id, False)
+                done += 1
+            except Exception:  # noqa: BLE001
+                pass
+        self.events.put(("reset_profiles_done", done))
 
     def on_free_disk(self) -> None:
         """Clear regenerable Chrome caches from every profile to reclaim disk
@@ -2181,6 +2226,20 @@ class App(ctk.CTk):
             self.free_disk_btn.configure(state="normal", text="Free up disk (clear caches)")
             self.accounts_status.configure(text="Clearing caches failed.")
             messagebox.showerror("Free up disk failed", str(evt[1]))
+        elif kind == "reset_profiles_done":
+            self.reset_profile_btn.configure(state="normal", text="Reset profile (fresh login)")
+            done = evt[1]
+            self.refresh_accounts()
+            self.accounts_status.configure(
+                text=f"Reset {done} profile(s) - now log them in fresh (Open in Chrome / auto-fill)."
+            )
+            messagebox.showinfo(
+                "Profiles reset",
+                f"Wiped {done} profile(s) and marked them logged out.\n\nNow log "
+                f"them in fresh: select them and use 'Open selected in Chrome' (or "
+                f"'Log in selected (auto-fill)'). The fresh session will persist, "
+                f"and picks should then submit.",
+            )
         elif kind == "sl_status":
             acc = self.repo.get_account(evt[1], include_password=False)
             label = acc.label if acc else f"#{evt[1]}"

@@ -652,6 +652,27 @@ def _prune_profile_cache(profile_dir: str, measure: bool = False) -> int:
     return freed
 
 
+def reset_profile(profile_dir: str) -> bool:
+    """Delete an account's Chrome profile entirely so the next launch starts
+    completely fresh -- like opening a brand-new browser.
+
+    Use this when a profile's saved session has gone stale/half-valid: the page
+    loads looking logged-in (the cookie is still there) but the server session
+    is dead, so the first real action (login submit or pick submit) is rejected
+    and the page does a full-screen refresh that loses everything. Wiping the
+    profile forces a clean login next time, which persists a valid session.
+    Returns True if a profile directory was removed.
+    """
+    try:
+        base = Path(profile_dir)
+    except Exception:  # noqa: BLE001
+        return False
+    if not base.exists():
+        return False
+    shutil.rmtree(base, ignore_errors=True)
+    return not base.exists()
+
+
 def prune_all_profile_caches() -> tuple[int, int]:
     """Prune caches from EVERY Chrome profile on disk.
 
