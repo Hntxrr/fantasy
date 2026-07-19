@@ -374,29 +374,51 @@ def build_login_landing(email: str, password: str, site_url: Optional[str] = Non
     """
     site = site_url or config.BASE_URL
     e_attr, p_attr = html.escape(email), html.escape(password)
-    e_js, p_js = json.dumps(email), json.dumps(password)
+    e_js, p_js, site_js = json.dumps(email), json.dumps(password), json.dumps(site)
     doc = f"""<!doctype html><html><head><meta charset="utf-8"><title>{e_attr}</title>
 <style>
  body{{background:#0b0d12;color:#f2f4f8;font-family:Segoe UI,Arial,sans-serif;padding:36px}}
- .card{{max-width:540px;margin:0 auto;background:#14161f;border:2px solid #2f6bff;border-radius:14px;padding:24px}}
- h1{{font-size:20px;margin:0 0 4px}} .muted{{color:#9aa3b2;font-size:13px;margin-bottom:16px}}
+ .card{{max-width:560px;margin:0 auto;background:#14161f;border:2px solid #2f6bff;border-radius:14px;padding:24px}}
+ h1{{font-size:20px;margin:0 0 4px}} .muted{{color:#9aa3b2;font-size:13px;margin-bottom:12px}}
+ .warn{{background:#3a1d1d;border:1px solid #b91c1c;color:#fecaca;border-radius:10px;
+   padding:12px 14px;font-size:13px;font-weight:600;margin:12px 0 4px}}
+ ol{{font-size:13px;color:#cdd3de;line-height:1.7;padding-left:20px;margin:14px 0}}
  label{{font-size:12px;color:#9aa3b2;display:block;margin-top:14px}}
  .row{{display:flex;gap:8px;margin-top:4px}}
  input{{flex:1;background:#0b0d12;color:#fff;border:1px solid #262a36;border-radius:8px;padding:10px;font-size:15px}}
  button{{background:#2f6bff;color:#fff;border:0;border-radius:8px;padding:0 14px;cursor:pointer;font-weight:700}}
- .go{{display:inline-block;margin-top:22px;background:#22c55e;color:#fff;padding:12px 18px;border-radius:10px;text-decoration:none;font-weight:700}}
+ .go{{display:inline-block;margin-top:22px;background:#22c55e;color:#fff;padding:12px 18px;border-radius:10px;text-decoration:none;font-weight:700;border:0;font-size:15px;cursor:pointer}}
+ #status{{margin-top:12px;font-size:13px;color:#22c55e;font-weight:600;min-height:18px}}
 </style></head><body><div class="card">
  <h1>Log in this account</h1>
- <div class="muted">This window is for ONE account. Copy the email + password, open the
-  login (button below), paste them and clear the captcha. Then close this window.</div>
+ <div class="muted">This window is for ONE account.</div>
+ <div class="warn">&#9888; Do NOT type the email &mdash; the site reloads on every keystroke,
+  which is why it "refreshes at the 25th character." Use Copy &rarr; Paste instead: pasting
+  drops the whole value in at once so it survives the reload.</div>
+ <ol>
+  <li>Click <b>Open login (email copied)</b> below &mdash; it copies the email and opens the site.</li>
+  <li>Click the site's email box and press <b>Ctrl&#8202;+&#8202;V</b> to paste. Let it reload.</li>
+  <li>Come back here, click <b>Copy password</b>, then paste it into the site's password box.</li>
+  <li>Clear the captcha, click the site's Log In, then close this window.</li>
+ </ol>
  <label>Email</label>
  <div class="row"><input id="em" value="{e_attr}" readonly onclick="this.select()">
-  <button onclick="cp({e_js},this)">Copy</button></div>
+  <button onclick="cp({e_js},this)">Copy email</button></div>
  <label>Password</label>
  <div class="row"><input id="pw" value="{p_attr}" readonly onclick="this.select()">
-  <button onclick="cp({p_js},this)">Copy</button></div>
- <a class="go" href="{html.escape(site)}" target="_blank" rel="noopener">Open RMFantasy login &#8594;</a>
- <script>function cp(v,b){{try{{navigator.clipboard.writeText(v);b.textContent='Copied';}}catch(e){{}}}}</script>
+  <button onclick="cp({p_js},this)">Copy password</button></div>
+ <button class="go" onclick="openLogin()">Open login (email copied) &#8594;</button>
+ <div id="status"></div>
+ <script>
+  function cp(v,b){{try{{navigator.clipboard.writeText(v);var t=b.textContent;b.textContent='Copied';
+    setTimeout(function(){{b.textContent=t;}},1200);}}catch(e){{}}}}
+  function openLogin(){{
+    try{{navigator.clipboard.writeText({e_js});
+      document.getElementById('status').textContent='Email copied to clipboard \\u2014 paste it into the site email box (Ctrl+V).';
+    }}catch(e){{}}
+    window.open({site_js},'_blank','noopener');
+  }}
+ </script>
 </div></body></html>"""
     fd, path = tempfile.mkstemp(prefix="rm_login_", suffix=".html")
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
