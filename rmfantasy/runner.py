@@ -182,14 +182,6 @@ class ConcurrentRunner:
                     return self._finish(assignment, False, "Cancelled.", repo)
                 try:
                     return self._attempt(account, request, assignment, repo, status, proxy)
-                except NotLoggedIn as exc:
-                    # The account was flagged logged-in but isn't -> correct the
-                    # flag so the Accounts list reflects reality (turns red).
-                    try:
-                        repo.set_session_valid(assignment.account_id, False)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    return self._finish(assignment, False, str(exc), repo)
                 except EligibilityError as exc:
                     # Permanent for this round -- do not retry.
                     return self._finish(assignment, False, str(exc), repo)
@@ -213,12 +205,11 @@ class ConcurrentRunner:
         with automation.chrome_session(
             account.profile_dir, headless=self.headless, proxy=proxy,
         ) as driver:
-            # Don't try to auto-login during picks (the site's captcha blocks it);
-            # a logged-out account gets a clear NotLoggedIn instead of a crash.
+            # Auto-login during picks works on this site, so allow it (reuses a
+            # saved session if present, else logs in).
             automation.ensure_logged_in(
                 driver, account.email, account.password,
                 login_timeout=self.login_timeout, status_cb=status,
-                attempt_login=False,
             )
             repo.set_session_valid(account.id, True)
             round_label = automation.get_round_label(driver)

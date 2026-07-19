@@ -137,6 +137,18 @@ def _chrome_options(profile_dir: str, headless: bool) -> Options:
     opts.add_argument("--window-size=1200,860")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
+    # Trim each browser's footprint so hundreds of runs don't exhaust the
+    # machine's memory / window handles (the cause of the ~400-browsers wall).
+    for flag in (
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-features=Translate,MediaRouter,OptimizationHints",
+    ):
+        opts.add_argument(flag)
     # Suppress Chrome's "Save password?" and "Save address?" bubbles -- they're
     # browser UI that covers the in-page 'Account created' panel, forcing extra
     # clicks. Turning them off lets you just create/log in and hit the button.
@@ -493,16 +505,42 @@ def profile_has_session(profile_dir: str) -> str:
     return "unknown"
 
 
+def _hard_close(driver) -> None:
+    """Quit the driver AND make sure its chromedriver process is really gone.
+
+    Under a long run, driver.quit() sometimes leaves the chromedriver.exe (and
+    its Chrome) alive on Windows; those zombies pile up and exhaust window/GDI
+    handles, which then shows as 'stale element / GetHandleVerifier' errors a few
+    hundred browsers in. Explicitly killing the service process prevents that.
+    """
+    svc = getattr(driver, "service", None)
+    proc = getattr(svc, "process", None) if svc is not None else None
+    try:
+        driver.quit()
+    except Exception:  # noqa: BLE001
+        pass
+    # If chromedriver survived quit(), kill it (and its child Chrome) hard.
+    try:
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @contextmanager
 def chrome_session(profile_dir: str, headless: bool = False, proxy: Optional[str] = None):
     driver = build_driver(profile_dir, headless=headless, proxy=proxy)
     try:
         yield driver
     finally:
-        try:
-            driver.quit()
-        except Exception:  # pragma: no cover
-            pass
+        _hard_close(driver)
 
 
 # --------------------------------------------------------------------------- #
@@ -765,23 +803,15 @@ def ensure_logged_in(
     driver.get(config.BASE_URL)
     WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
-    # Give a saved session a few seconds to render the (editable) pick form
-    # before deciding it's logged out (avoids false negatives on slow loads).
-    try:
-        WebDriverWait(driver, 8).until(lambda d: is_logged_in(d))
+    if is_logged_in(driver):
         if status_cb:
             status_cb("Already logged in (reused session).")
         return
-    except TimeoutException:
-        pass
 
     if not attempt_login:
-        raise NotLoggedIn(
-            "Not logged in - log this account in first (Accounts tab: 'Log in "
-            "selected' or 'Open selected in Chrome'), then Retry. The site's "
-            "captcha blocks automatic login during picks."
-        )
+        raise NotLoggedIn("Not logged in (auto-login disabled for this run).")
 
+    # Auto-login works on this site during picks, so do it.
     if status_cb:
         status_cb("Logging in...")
     do_login(driver, email, password, timeout=login_timeout)
