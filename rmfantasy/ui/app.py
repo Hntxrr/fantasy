@@ -1726,6 +1726,10 @@ class App(ctk.CTk):
         self.watch_btn = ctk.CTkButton(actions, text="\U0001F441 Watch selected", width=140, height=40,
                                        command=self.on_watch_selected)
         self.watch_btn.pack(side="left", padx=4)
+        self.run_reset_login_btn = ctk.CTkButton(actions, text="Reset & log in", fg_color="#3a6ea5",
+                                                 hover_color="#4880bd", height=40, width=120,
+                                                 command=self.on_run_reset_and_login)
+        self.run_reset_login_btn.pack(side="left", padx=4)
         self.reset_btn = ctk.CTkButton(actions, text="Reset round", fg_color="#555555",
                                        hover_color="#666666", height=40, width=100,
                                        command=self.on_reset_round)
@@ -1901,6 +1905,59 @@ class App(ctk.CTk):
             self._set_run_start_position(int(num))
         except (ValueError, TypeError):
             pass
+
+    def _selected_run_account_ids(self) -> list[int]:
+        """Account ids for the currently-selected rows in the Run Picks table."""
+        ids = []
+        for iid in self.run_tree.selection():
+            if iid.startswith("acc"):
+                try:
+                    ids.append(int(iid[3:]))
+                except ValueError:
+                    pass
+        return ids
+
+    def on_run_reset_and_login(self):
+        """From the Run Picks table: wipe the selected accounts' profiles and log
+        them back in fresh with their saved email/password."""
+        if self.run_thread and self.run_thread.is_alive():
+            messagebox.showinfo(
+                "Run in progress",
+                "Stop the run first - the account profiles are in use while a run "
+                "is going.",
+            )
+            return
+        if self.assist_thread and self.assist_thread.is_alive():
+            messagebox.showinfo("Busy", "A login run is already in progress.")
+            return
+        ids = self._selected_run_account_ids()
+        if not ids:
+            messagebox.showinfo(
+                "No selection",
+                "Select one or more account rows in the table first "
+                "(Ctrl/Shift-click for multiple).",
+            )
+            return
+        if not messagebox.askyesno(
+            "Reset & log in",
+            f"Wipe the saved browser profile for {len(ids)} selected account(s) and "
+            "then log them in fresh using their saved email + password?\n\n"
+            "Use this on accounts that show green but refresh/fail on submit "
+            "(stale session). Each browser auto-fills the login - clear the captcha "
+            "if one appears.",
+        ):
+            return
+        targets = []
+        for i in ids:
+            acc = self.repo.get_account(i, include_password=False)
+            if acc is not None:
+                targets.append((i, acc.profile_dir))
+        self.run_reset_login_btn.configure(state="disabled", text="Resetting...")
+        for i in ids:
+            self._update_run_row(i, "Resetting profile + logging in fresh...", "busy", remember=False)
+        threading.Thread(
+            target=self._reset_profiles_worker, args=(targets, True), daemon=True
+        ).start()
 
     def on_watch_selected(self):
         if self.run_thread and self.run_thread.is_alive():
@@ -2280,6 +2337,8 @@ class App(ctk.CTk):
         elif kind == "reset_profiles_done":
             self.reset_profile_btn.configure(state="normal", text="Reset profile (fresh login)")
             self.reset_login_btn.configure(state="normal", text="Reset & log in (auto-fill)")
+            if hasattr(self, "run_reset_login_btn"):
+                self.run_reset_login_btn.configure(state="normal", text="Reset & log in")
             done_ids, then_login = evt[1], evt[2]
             # DB writes happen here on the UI thread (SQLite is single-thread).
             for aid in done_ids:
