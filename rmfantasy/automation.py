@@ -603,10 +603,21 @@ def find_rider_selects(driver) -> list:
 
 
 def _option_names(select_el) -> dict[str, str]:
-    """Map normalized option text -> exact visible text (skipping placeholders)."""
+    """Map normalized option text -> exact visible text (skipping placeholders).
+
+    Stale-tolerant: returns {} if the <select> is being re-rendered (AJAX), so
+    callers can wait and retry instead of crashing.
+    """
     out: dict[str, str] = {}
-    for opt in Select(select_el).options:
-        text = (opt.text or "").strip()
+    try:
+        options = Select(select_el).options
+    except StaleElementReferenceException:
+        return out
+    for opt in options:
+        try:
+            text = (opt.text or "").strip()
+        except StaleElementReferenceException:
+            continue
         if _norm(text) in selectors.PLACEHOLDER_OPTION_TEXTS:
             continue
         if text:
@@ -617,8 +628,15 @@ def _option_names(select_el) -> dict[str, str]:
 def get_round_label(driver) -> str:
     """Best-effort read of the current round title (e.g. 'Round #7 - Spring Creek')."""
     for css in ("h1", "h2", ".roundTitle", ".pickHeader"):
-        for el in driver.find_elements(By.CSS_SELECTOR, css):
-            txt = " ".join((el.text or "").split())
+        try:
+            elements = driver.find_elements(By.CSS_SELECTOR, css)
+        except Exception:  # noqa: BLE001
+            continue
+        for el in elements:
+            try:
+                txt = " ".join((el.text or "").split())
+            except StaleElementReferenceException:
+                continue
             if txt and "round" in txt.lower():
                 return txt
     return "Current round"
@@ -862,34 +880,98 @@ def _select_rider(select_el, rider: str) -> None:
     Select(select_el).select_by_visible_text(options[key])
 
 
-def _select_rider_at(driver, index: int, rider: str, attempts: int = 4) -> None:
-    """Select a rider in dropdown ``index``, re-finding the dropdowns each try.
+def _wait_for_rider_dropdowns(driver, timeout: float = 25.0) -> None:
+    """Wait until the rider dropdowns exist AND are populated (AJAX finished).
 
-    Picking a rider triggers an AJAX refresh that re-renders the other
-    dropdowns, so a reference grabbed earlier goes stale. Re-finding before each
-    (re)try makes the selection resilient to that.
+    After a login/reload the dropdowns render empty and fill in via AJAX. Acting
+    before they settle is what causes the stale-element errors, so we wait for
+    the expected number of selects, each with real options, and stable across
+    two reads.
     """
+    deadline = time.time() + timeout
+    stable = 0
+    last_counts: list[int] | None = None
+    while time.time() < deadline:
+        selects = find_rider_selects(driver)
+        if len(selects) >= selectors.EXPECTED_RIDER_SELECTS:
+            try:
+                counts = [len(_option_names(s)) for s in selects]
+            except StaleElementReferenceException:
+                counts = None
+            if counts and all(c > 0 for c in counts):
+                if counts == last_counts:
+                    stable += 1
+                    if stable >= 2:   # unchanged for ~two polls -> settled
+                        return
+                else:
+                    stable = 0
+                last_counts = counts
+        time.sleep(0.5)
+    # Timed out waiting for a fully-populated set; carry on and let the
+    # per-rider retries cope with whatever is there.
+
+
+def _select_rider_at(driver, index: int, rider: str, attempts: int = 6) -> None:
+    """Select a rider in dropdown ``index``, re-finding + waiting on each try.
+
+    Handles both stale references and dropdowns still populating via AJAX (empty
+    options / rider momentarily absent) by re-reading and retrying.
+    """
+    key = _norm(rider)
     last: Exception | None = None
     for _ in range(max(1, attempts)):
         try:
             selects = find_rider_selects(driver)
             if index >= len(selects):
-                raise SubmissionError(
-                    f"Rider dropdown #{index + 1} not found ({len(selects)} present)."
-                )
-            _select_rider(selects[index], rider)
+                last = SubmissionError(f"Rider dropdown #{index + 1} not present.")
+                time.sleep(0.5)
+                continue
+            select_el = selects[index]
+            options = _option_names(select_el)
+            if not options:                    # still populating -> wait
+                time.sleep(0.5)
+                continue
+            if key not in options:             # transient during re-render -> retry
+                last = EligibilityError([rider])
+                time.sleep(0.4)
+                continue
+            Select(select_el).select_by_visible_text(options[key])
             return
         except StaleElementReferenceException as exc:
             last = exc
             time.sleep(0.4)  # let the AJAX re-render settle, then re-find
+    if isinstance(last, EligibilityError):
+        raise last
     raise SubmissionError(
         f"Could not set rider '{rider}' - the dropdowns kept refreshing."
     ) from last
 
 
+def _check_eligibility_resilient(driver, request: PickRequest, attempts: int = 5) -> list[str]:
+    """Eligibility check that re-finds the dropdowns and tolerates AJAX churn."""
+    last_exc: Exception | None = None
+    for _ in range(max(1, attempts)):
+        try:
+            selects = find_rider_selects(driver)
+            if len(selects) < selectors.EXPECTED_RIDER_SELECTS:
+                time.sleep(0.5)
+                continue
+            if not _option_names(selects[0]):   # not populated yet
+                time.sleep(0.5)
+                continue
+            return check_eligibility(selects, request)
+        except StaleElementReferenceException as exc:
+            last_exc = exc
+            time.sleep(0.4)
+    # Couldn't validate cleanly; skip the pre-check and let selection surface
+    # any genuinely-missing rider (it re-checks per dropdown anyway).
+    return []
+
+
 def select_all_riders(driver, request: PickRequest) -> None:
-    selects = find_rider_selects(driver)
-    missing = check_eligibility(selects, request)
+    # Wait for the (AJAX-populated) dropdowns to settle before touching them.
+    _wait_for_rider_dropdowns(driver)
+    missing = _check_eligibility_resilient(driver, request)
     if missing:
         raise EligibilityError(missing)
     # Re-find the dropdowns before each pick, since selecting one re-renders the
