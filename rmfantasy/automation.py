@@ -1745,6 +1745,53 @@ def dump_picks_page(driver) -> str:
     except Exception:  # noqa: BLE001
         pass
 
+    # If this account is NOT logged in, dump the login modal so we can see the
+    # login form + whether the Log In button is reCAPTCHA-gated (which decides
+    # if automated login is even possible for the tail-end accounts).
+    logged_in_now = False
+    try:
+        logged_in_now = is_logged_in(driver)
+    except Exception:  # noqa: BLE001
+        pass
+    if not logged_in_now:
+        lines.append("")
+        lines.append("=== LOGIN MODAL (account is NOT logged in) ===")
+        try:
+            link = _find_first_visible(driver, [selectors.LOGIN_LINK_CSS])
+            if link is not None:
+                _click(driver, link)
+            WebDriverWait(driver, 10).until(
+                EC.visibility_of_element_located((By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS))
+            )
+            lines.append("login modal opened: yes")
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"could not open login modal: {exc}")
+        # reCAPTCHA detection anywhere on the page / modal.
+        try:
+            grc = driver.find_elements(By.CSS_SELECTOR, ".g-recaptcha, [data-sitekey], iframe[src*='recaptcha']")
+            lines.append(f"reCAPTCHA elements present: {len(grc)}")
+            for el in grc[:4]:
+                try:
+                    oh = " ".join((el.get_attribute("outerHTML") or "").split())[:200]
+                    lines.append(f"    {oh}")
+                except Exception:  # noqa: BLE001
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
+        lines.append("--- login modal buttons ---")
+        try:
+            modal = driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_MODAL_CSS)
+            for b in modal.find_elements(By.CSS_SELECTOR, "button, input[type='submit'], input[type='button'], a.btn"):
+                try:
+                    if not b.is_displayed():
+                        continue
+                    oh = " ".join((b.get_attribute("outerHTML") or "").split())[:220]
+                    lines.append(f"    {oh}")
+                except Exception:  # noqa: BLE001
+                    continue
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"could not read modal buttons: {exc}")
+
     return "\n".join(lines)
 
 
