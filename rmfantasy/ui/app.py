@@ -524,6 +524,11 @@ class App(ctk.CTk):
             hover_color=BRAND_HOVER, command=self.on_assist_login,
         )
         self.assist_login_btn.pack(side="left", padx=4)
+        self.reset_login_btn = ctk.CTkButton(
+            login_btns, text="Reset & log in (auto-fill)", fg_color=BRAND,
+            hover_color=BRAND_HOVER, command=self.on_reset_and_login,
+        )
+        self.reset_login_btn.pack(side="left", padx=4)
         self.assist_stop_btn = ctk.CTkButton(
             login_btns, text="Stop", fg_color=DANGER, hover_color=DANGER_HOV,
             width=70, state="disabled", command=self.on_assist_stop,
@@ -736,18 +741,56 @@ class App(ctk.CTk):
                 targets.append((i, acc.profile_dir))
         self.reset_profile_btn.configure(state="disabled", text="Resetting...")
         self.accounts_status.configure(text=f"Resetting {len(targets)} profile(s)...")
-        threading.Thread(target=self._reset_profiles_worker, args=(targets,), daemon=True).start()
+        threading.Thread(
+            target=self._reset_profiles_worker, args=(targets, False), daemon=True
+        ).start()
 
-    def _reset_profiles_worker(self, targets) -> None:
-        done = 0
+    def on_reset_and_login(self) -> None:
+        """Wipe the selected accounts' profiles AND immediately log them back in
+        with their saved email/password (fresh session)."""
+        if self.assist_thread and self.assist_thread.is_alive():
+            messagebox.showinfo("Busy", "A login run is already in progress.")
+            return
+        ids = self._selected_account_ids()
+        if not ids:
+            messagebox.showinfo(
+                "No selection",
+                "Select the account(s) to reset + log in (you can multi-select).",
+            )
+            return
+        if not messagebox.askyesno(
+            "Reset & log in",
+            f"Wipe the saved browser profile for {len(ids)} account(s) and then log "
+            "them in fresh using their saved email + password?\n\n"
+            "This is the fix for accounts that show green but refresh/fail on submit "
+            "(their stored session went stale). Each browser auto-fills the login - "
+            "clear the captcha if one appears.",
+        ):
+            return
+        targets = []
+        for i in ids:
+            acc = self.repo.get_account(i, include_password=False)
+            if acc is not None:
+                targets.append((i, acc.profile_dir))
+        self.reset_login_btn.configure(state="disabled", text="Resetting...")
+        self.accounts_status.configure(
+            text=f"Resetting {len(targets)} profile(s), then logging in fresh..."
+        )
+        threading.Thread(
+            target=self._reset_profiles_worker, args=(targets, True), daemon=True
+        ).start()
+
+    def _reset_profiles_worker(self, targets, then_login: bool = False) -> None:
+        # Only touch the filesystem here -- DB writes happen on the UI thread
+        # (SQLite connection is single-thread).
+        done_ids = []
         for acc_id, profile_dir in targets:
             try:
                 automation.reset_profile(profile_dir)
-                self.repo.set_session_valid(acc_id, False)
-                done += 1
+                done_ids.append(acc_id)
             except Exception:  # noqa: BLE001
                 pass
-        self.events.put(("reset_profiles_done", done))
+        self.events.put(("reset_profiles_done", done_ids, then_login))
 
     def on_free_disk(self) -> None:
         """Clear regenerable Chrome caches from every profile to reclaim disk
@@ -866,6 +909,14 @@ class App(ctk.CTk):
         ids = self._selected_account_ids()
         if not ids:
             messagebox.showinfo("No selection", "Select the accounts to log in.")
+            return
+        self._begin_assist_login(ids)
+
+    def _begin_assist_login(self, ids: list[int]) -> None:
+        """Start the auto-fill (assisted) login flow for the given account ids."""
+        if not ids:
+            return
+        if self.assist_thread and self.assist_thread.is_alive():
             return
         try:
             conc = int(self.login_conc_entry.get() or "5")
@@ -2228,18 +2279,31 @@ class App(ctk.CTk):
             messagebox.showerror("Free up disk failed", str(evt[1]))
         elif kind == "reset_profiles_done":
             self.reset_profile_btn.configure(state="normal", text="Reset profile (fresh login)")
-            done = evt[1]
+            self.reset_login_btn.configure(state="normal", text="Reset & log in (auto-fill)")
+            done_ids, then_login = evt[1], evt[2]
+            # DB writes happen here on the UI thread (SQLite is single-thread).
+            for aid in done_ids:
+                try:
+                    self.repo.set_session_valid(aid, False)
+                except Exception:  # noqa: BLE001
+                    pass
             self.refresh_accounts()
-            self.accounts_status.configure(
-                text=f"Reset {done} profile(s) - now log them in fresh (Open in Chrome / auto-fill)."
-            )
-            messagebox.showinfo(
-                "Profiles reset",
-                f"Wiped {done} profile(s) and marked them logged out.\n\nNow log "
-                f"them in fresh: select them and use 'Open selected in Chrome' (or "
-                f"'Log in selected (auto-fill)'). The fresh session will persist, "
-                f"and picks should then submit.",
-            )
+            if then_login and done_ids:
+                self.accounts_status.configure(
+                    text=f"Reset {len(done_ids)} profile(s) - logging them in fresh..."
+                )
+                self._begin_assist_login(done_ids)
+            else:
+                self.accounts_status.configure(
+                    text=f"Reset {len(done_ids)} profile(s) - now log them in fresh (Open in Chrome / auto-fill)."
+                )
+                messagebox.showinfo(
+                    "Profiles reset",
+                    f"Wiped {len(done_ids)} profile(s) and marked them logged out.\n\n"
+                    f"Now log them in fresh: select them and use 'Open selected in "
+                    f"Chrome' (or 'Log in selected (auto-fill)'). The fresh session "
+                    f"will persist, and picks should then submit.",
+                )
         elif kind == "sl_status":
             acc = self.repo.get_account(evt[1], include_password=False)
             label = acc.label if acc else f"#{evt[1]}"
