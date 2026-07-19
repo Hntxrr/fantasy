@@ -764,18 +764,44 @@ def do_login(driver, email: str, password: str, timeout: int = 30) -> None:
     except TimeoutException as exc:
         raise LoginRequired("Login modal / email field did not appear.") from exc
 
-    email_el = driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS)
-    pwd_el = driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_PASSWORD_CSS)
-    _fill_element(driver, email_el, email)   # stale-resistant fill
-    _fill_element(driver, pwd_el, password)
+    # The site AJAX-refreshes the login form once the email changes, which
+    # re-renders (and staleifies) the password field. So: fill the email, let
+    # that refresh settle, then RE-FIND the password field before filling it.
+    def _fill_login_fields() -> None:
+        WebDriverWait(driver, timeout).until(
+            EC.visibility_of_element_located((By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS))
+        )
+        _fill_element(driver, driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS), email)
+        time.sleep(1.3)  # allow the email-triggered form refresh to complete
+        WebDriverWait(driver, timeout).until(
+            EC.visibility_of_element_located((By.CSS_SELECTOR, selectors.LOGIN_PASSWORD_CSS))
+        )
+        _fill_element(driver, driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_PASSWORD_CSS), password)
+        # If the refresh wiped the email, put it back.
+        try:
+            em = driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_EMAIL_CSS)
+            if not (em.get_attribute("value") or "").strip():
+                _fill_element(driver, em, email)
+        except Exception:  # noqa: BLE001
+            pass
 
-    # Submit: prefer an explicit submit button; fall back to button text.
+    for _ in range(3):
+        try:
+            _fill_login_fields()
+            break
+        except StaleElementReferenceException:
+            time.sleep(0.5)
+
+    # Submit: re-find fresh (the form may have re-rendered again).
     submit = _find_first_visible(driver, [selectors.LOGIN_SUBMIT_CSS])
     if submit is not None:
         _click(driver, submit)
     elif not _click_by_text(driver, selectors.LOGIN_SUBMIT_TEXTS):
         # Last resort: submit the form via the password field.
-        pwd_el.submit()
+        try:
+            driver.find_element(By.CSS_SELECTOR, selectors.LOGIN_PASSWORD_CSS).submit()
+        except Exception:  # noqa: BLE001
+            pass
 
     # Success == modal closes OR rider dropdowns become enabled.
     try:
