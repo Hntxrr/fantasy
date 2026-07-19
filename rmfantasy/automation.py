@@ -650,8 +650,13 @@ def login_state(driver) -> str:
 def _click(driver, el) -> None:
     try:
         el.click()
-    except _TRANSIENT:
+        return
+    except Exception:  # noqa: BLE001 - fall back to a JS click
+        pass
+    try:
         driver.execute_script("arguments[0].click();", el)
+    except Exception:  # noqa: BLE001 - stale/gone; caller stays resilient
+        pass
 
 
 def _click_by_text(driver, texts: Iterable[str], scope_css: Optional[str] = None) -> bool:
@@ -879,10 +884,17 @@ def _signup_scope(driver):
 def _find_input_by_placeholder(scope, placeholder_substrings):
     """First visible <input>/<textarea> whose placeholder contains any substring."""
     subs = [s.casefold() for s in placeholder_substrings]
-    for el in scope.find_elements(By.CSS_SELECTOR, "input, textarea"):
-        if not _is_visible(el):
+    try:
+        elements = scope.find_elements(By.CSS_SELECTOR, "input, textarea")
+    except Exception:  # noqa: BLE001
+        return None
+    for el in elements:
+        try:
+            if not _is_visible(el):
+                continue
+            ph = (el.get_attribute("placeholder") or "").casefold()
+        except StaleElementReferenceException:
             continue
-        ph = (el.get_attribute("placeholder") or "").casefold()
         if ph and any(s in ph for s in subs):
             return el
     return None
@@ -893,7 +905,10 @@ def _fill_element(driver, el, value: str) -> None:
         el.clear()
     except Exception:  # noqa: BLE001
         pass
-    el.send_keys(value)
+    try:
+        el.send_keys(value)
+    except Exception:  # noqa: BLE001 - element went stale mid-fill; skip
+        return
     # Fire the events client-side frameworks listen for, so validation runs and
     # a "disabled until valid" Submit button becomes enabled.
     try:
@@ -1008,20 +1023,23 @@ def _find_select_with_option(scope, needles):
 
 def _select_option_tolerant(select_el, wanted_variants) -> bool:
     """Select the first option matching any variant (exact, then contains)."""
-    sel = Select(select_el)
-    options = sel.options
-    for variant in wanted_variants:
-        v = variant.casefold()
-        for o in options:
-            if (o.text or "").strip().casefold() == v:
-                sel.select_by_visible_text(o.text)
-                return True
-    for variant in wanted_variants:
-        v = variant.casefold()
-        for o in options:
-            if v and v in (o.text or "").strip().casefold():
-                sel.select_by_visible_text(o.text)
-                return True
+    try:
+        sel = Select(select_el)
+        options = sel.options
+        for variant in wanted_variants:
+            v = variant.casefold()
+            for o in options:
+                if (o.text or "").strip().casefold() == v:
+                    sel.select_by_visible_text(o.text)
+                    return True
+        for variant in wanted_variants:
+            v = variant.casefold()
+            for o in options:
+                if v and v in (o.text or "").strip().casefold():
+                    sel.select_by_visible_text(o.text)
+                    return True
+    except Exception:  # noqa: BLE001 - stale/detached select; treat as not-set
+        return False
     return False
 
 
@@ -1035,22 +1053,25 @@ def _check_age_radio(driver, label_substrings) -> bool:
             f"'{p}')]"
         )
         for lbl in driver.find_elements(By.XPATH, xp):
-            if not _is_visible(lbl):
-                continue
-            fid = lbl.get_attribute("for")
-            if fid:
-                els = driver.find_elements(By.ID, fid)
-                if els:
-                    _click(driver, els[0])
+            try:
+                if not _is_visible(lbl):
+                    continue
+                fid = lbl.get_attribute("for")
+                if fid:
+                    els = driver.find_elements(By.ID, fid)
+                    if els:
+                        _click(driver, els[0])
+                        return True
+                inside = lbl.find_elements(By.CSS_SELECTOR, "input[type='radio']")
+                if inside:
+                    _click(driver, inside[0])
                     return True
-            inside = lbl.find_elements(By.CSS_SELECTOR, "input[type='radio']")
-            if inside:
-                _click(driver, inside[0])
-                return True
-            near = lbl.find_elements(By.XPATH, "preceding::input[@type='radio'][1]")
-            if near:
-                _click(driver, near[0])
-                return True
+                near = lbl.find_elements(By.XPATH, "preceding::input[@type='radio'][1]")
+                if near:
+                    _click(driver, near[0])
+                    return True
+            except StaleElementReferenceException:
+                continue
     return False
 
 
