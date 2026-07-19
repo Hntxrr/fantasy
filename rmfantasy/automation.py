@@ -25,6 +25,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from contextlib import contextmanager
@@ -505,33 +506,85 @@ def profile_has_session(profile_dir: str) -> str:
     return "unknown"
 
 
-def _hard_close(driver) -> None:
-    """Quit the driver AND make sure its chromedriver process is really gone.
+def _kill_pid_tree_windows(pid: int) -> None:
+    """Kill a process and ALL its descendants on Windows via taskkill /T."""
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=15,
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
-    Under a long run, driver.quit() sometimes leaves the chromedriver.exe (and
-    its Chrome) alive on Windows; those zombies pile up and exhaust window/GDI
-    handles, which then shows as 'stale element / GetHandleVerifier' errors a few
-    hundred browsers in. Explicitly killing the service process prevents that.
+
+def _hard_close(driver) -> None:
+    """Quit the driver AND guarantee its entire Chrome process tree is gone.
+
+    THE ~400-BROWSER WALL: chromedriver launches chrome.exe, which in turn
+    spawns a tree of renderer/GPU child processes. Killing only chromedriver
+    (what we used to do) leaves that whole Chrome tree ORPHANED. Over a long
+    run those orphans pile up and exhaust the machine's RAM / handles, so new
+    Chrome instances stop launching -- which surfaces as browsers that "open
+    then close right away" and an 'Unexpected error' a few hundred accounts in.
+
+    Fix: snapshot the full process tree before quitting, quit gracefully (so
+    the session/cookies flush to the profile), then reap every survivor.
     """
     svc = getattr(driver, "service", None)
     proc = getattr(svc, "process", None) if svc is not None else None
+    driver_pid = getattr(proc, "pid", None)
+
+    # Snapshot the full tree (chromedriver -> chrome.exe -> renderers) up front
+    # so we can reap orphans regardless of how quit() behaves. psutil verifies
+    # pid+create_time, so it won't kill a recycled PID by mistake.
+    ps_tree = []
+    if driver_pid is not None:
+        try:
+            import psutil
+
+            root = psutil.Process(driver_pid)
+            ps_tree = root.children(recursive=True) + [root]
+        except Exception:  # noqa: BLE001 - psutil missing or process already gone
+            ps_tree = []
+
+    # Graceful close first: lets Chrome flush the session/cookies to disk so the
+    # account stays logged in next time.
     try:
         driver.quit()
     except Exception:  # noqa: BLE001
         pass
-    # If chromedriver survived quit(), kill it (and its child Chrome) hard.
-    try:
-        if proc is not None and proc.poll() is None:
+
+    if ps_tree:
+        # Reap any member of the tree that survived quit().
+        try:
+            import psutil
+
+            alive = [p for p in ps_tree if p.is_running()]
+            for p in alive:
+                try:
+                    p.kill()
+                except Exception:  # noqa: BLE001
+                    pass
             try:
+                psutil.wait_procs(alive, timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        # No psutil: best-effort OS-level tree kill. If quit() hung, the tree is
+        # still intact and taskkill /T reaps chrome.exe + renderers too.
+        if driver_pid is not None and sys.platform.startswith("win"):
+            _kill_pid_tree_windows(driver_pid)
+        try:
+            if proc is not None and proc.poll() is None:
                 proc.kill()
-            except Exception:  # noqa: BLE001
-                pass
-            try:
                 proc.wait(timeout=5)
-            except Exception:  # noqa: BLE001
-                pass
-    except Exception:  # noqa: BLE001
-        pass
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @contextmanager

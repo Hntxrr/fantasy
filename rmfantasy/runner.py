@@ -29,7 +29,7 @@ from typing import Callable, Optional
 
 from . import automation
 from .assignment import RoundAssignment
-from selenium.common.exceptions import StaleElementReferenceException
+from selenium.common.exceptions import StaleElementReferenceException, WebDriverException
 
 from .automation import (
     AutomationError,
@@ -186,9 +186,14 @@ class ConcurrentRunner:
                     # Permanent for this round -- do not retry.
                     return self._finish(assignment, False, str(exc), repo)
                 except (LoginRequired, SubmissionError, AutomationError,
-                        StaleElementReferenceException) as exc:
+                        StaleElementReferenceException, WebDriverException) as exc:
+                    # WebDriverException covers a crashed/unreachable Chrome
+                    # (invalid session id, disconnected, GetHandleVerifier, ...).
+                    # Retry with a fresh browser instead of dead-ending as an
+                    # 'Unexpected error'.
                     last_error = exc
-                    status(f"Attempt {attempt}/{self.submit_retries} failed: {exc}")
+                    short = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+                    status(f"Attempt {attempt}/{self.submit_retries} failed: {short}")
                     if attempt < self.submit_retries:
                         time.sleep(self.retry_delay)
             return self._finish(
