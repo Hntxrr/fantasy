@@ -101,14 +101,12 @@ class Repository:
         )
 
     def list_accounts(self, include_password: bool = False) -> list[Account]:
-        # Logged-in (session-valid) accounts first, then not-logged-in ones.
-        # Valid accounts are ordered by WHEN they logged in (last_login_at ASC),
-        # so a freshly logged-in account drops to the BOTTOM of the valid group
-        # instead of jumping into the middle by creation order. Not-logged-in
-        # accounts (NULL last_login_at) keep their add order (id ASC) at the end.
+        # Stable ADD ORDER (id ASC = creation order): accounts always appear in
+        # the order they were created/imported, so newly added or signed-up
+        # accounts land at the BOTTOM of the list -- even once they're signed in
+        # -- and the list never reshuffles when a login status changes.
         rows = self.conn.execute(
-            "SELECT * FROM accounts "
-            "ORDER BY session_valid DESC, last_login_at ASC, id ASC"
+            "SELECT * FROM accounts ORDER BY id ASC"
         ).fetchall()
         return [self._row_to_account(r, include_password) for r in rows]
 

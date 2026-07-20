@@ -772,15 +772,19 @@ def _option_names(select_el) -> dict[str, str]:
     callers can wait and retry instead of crashing.
     """
     out: dict[str, str] = {}
+    # Read ALL option labels in a SINGLE JS round-trip. Reading opt.text one at
+    # a time is ~230 WebDriver calls per dropdown (seconds of latency); this is
+    # one call and makes rider selection near-instant.
     try:
-        options = Select(select_el).options
-    except StaleElementReferenceException:
+        texts = select_el.parent.execute_script(
+            "return Array.prototype.map.call(arguments[0].options,"
+            " function(o){ return o.text; });",
+            select_el,
+        )
+    except (StaleElementReferenceException, WebDriverException):
         return out
-    for opt in options:
-        try:
-            text = (opt.text or "").strip()
-        except StaleElementReferenceException:
-            continue
+    for text in texts or []:
+        text = (text or "").strip()
         if _norm(text) in selectors.PLACEHOLDER_OPTION_TEXTS:
             continue
         if text:
@@ -1127,46 +1131,18 @@ def wait_for_wicket_ajax(driver, timeout: float = 15.0) -> None:
         time.sleep(0.15)
 
 
-def _select_rider_at(driver, index: int, rider: str, attempts: int = 4) -> None:
-    """Select a rider in dropdown ``index``, re-finding the dropdowns each try
-    and waiting for the Wicket AJAX re-render to settle afterwards.
-
-    Selecting a rider triggers a Wicket AJAX refresh that REPLACES the other
-    dropdown elements, so we must re-find them before each pick (a reference
-    grabbed up front goes stale) and let the server record the change before
-    moving on -- otherwise the pick is lost.
-    """
-    last: Exception | None = None
-    for _ in range(max(1, attempts)):
-        try:
-            selects = find_rider_selects(driver)
-            if index >= len(selects):
-                raise SubmissionError(
-                    f"Rider dropdown #{index + 1} not found ({len(selects)} present)."
-                )
-            _select_rider(selects[index], rider)
-            wait_for_wicket_ajax(driver)  # let the server record this pick
-            return
-        except StaleElementReferenceException as exc:
-            last = exc
-            wait_for_wicket_ajax(driver)  # re-render in flight; wait, then re-find
-    raise SubmissionError(
-        f"Could not set rider '{rider}' - the form kept re-rendering."
-    ) from last
-
-
 def select_all_riders(driver, request: PickRequest) -> None:
+    # Fast path: grab the dropdowns once and set them by index. The rider
+    # dropdowns do NOT re-render when you pick (this worked across hundreds of
+    # accounts), so re-finding per pick just added latency. The Wicket AJAX that
+    # matters happens on SUBMIT, which submit_picks waits on.
     selects = find_rider_selects(driver)
     missing = check_eligibility(selects, request)
     if missing:
         raise EligibilityError(missing)
-    # Re-find + settle before each pick, since selecting one re-renders the rest
-    # (Wicket AJAX). Sequential set-by-index on stale references silently drops
-    # picks, which is what makes the submit 'refresh' with nothing saved.
     for idx, rider in enumerate(request.core_five):
-        _select_rider_at(driver, idx, rider)
-    _select_rider_at(driver, selectors.WILDCARD_SELECT_INDEX, request.wildcard)
-    wait_for_wicket_ajax(driver)  # make sure the last pick is recorded
+        _select_rider(selects[idx], rider)
+    _select_rider(selects[selectors.WILDCARD_SELECT_INDEX], request.wildcard)
 
 
 def click_submit(driver) -> None:
