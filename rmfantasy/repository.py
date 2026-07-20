@@ -496,6 +496,17 @@ class Repository:
         self.conn.commit()
         return cur.rowcount
 
+    def set_submission_logs_success(self, log_ids: list[int], success: bool) -> int:
+        if not log_ids:
+            return 0
+        placeholders = ",".join("?" for _ in log_ids)
+        cur = self.conn.execute(
+            f"UPDATE submission_log SET success = ? WHERE id IN ({placeholders})",
+            (1 if success else 0, *log_ids),
+        )
+        self.conn.commit()
+        return cur.rowcount
+
     def list_submission_logs(self, limit: int = 500) -> list[SubmissionLog]:
         rows = self.conn.execute(
             "SELECT * FROM submission_log ORDER BY id DESC LIMIT ?", (limit,)

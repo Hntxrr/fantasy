@@ -2079,6 +2079,8 @@ class App(ctk.CTk):
                       hover_color="#8f3636", command=self.on_delete_selected_history).pack(side="left", padx=4)
         ctk.CTkButton(bar, text="Delete all failed", width=120, fg_color="#7a2e2e",
                       hover_color="#8f3636", command=self.on_delete_failed_history).pack(side="left", padx=4)
+        ctk.CTkButton(bar, text="Mark selected as success", width=160, fg_color="#2c6e49",
+                      hover_color="#358257", command=self.on_mark_history_success).pack(side="left", padx=4)
         self.history_count = ctk.CTkLabel(bar, text="")
         self.history_count.pack(side="left", padx=12)
         ctk.CTkLabel(
@@ -2195,6 +2197,24 @@ class App(ctk.CTk):
             return
         self.repo.delete_submission_logs(ids)
         self.refresh_history()
+
+    def on_mark_history_success(self):
+        sel = self.history_tree.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select one or more history rows to mark as success.")
+            return
+        ids = []
+        for iid in sel:
+            e = self._history_by_iid.get(iid)
+            if e is not None and e.id is not None:
+                ids.append(e.id)
+        if not ids:
+            return
+        n = self.repo.set_submission_logs_success(ids, True)
+        self.refresh_history()
+        self.history_count.configure(
+            text=self.history_count.cget("text") + f"  (marked {n} as success)"
+        )
 
     def on_delete_failed_history(self):
         if not messagebox.askyesno(
