@@ -5,6 +5,21 @@ customtkinter>=5.2
 selenium>=4.20
 webdriver-manager>=4.0
 
+# Reliable teardown of the whole Chrome process tree between accounts. Without
+# this, orphaned chrome.exe processes pile up over a long run and exhaust the
+# machine (the "works for ~400 accounts then every one fails" wall).
+psutil>=5.9
+
+# Authenticated proxy support (host:port:user:pass) on the Sign Up tab.
+# selenium-wire runs a local relay that injects the proxy credentials, which
+# works on modern Chrome where the old proxy-auth extension no longer does.
+# The pins avoid known selenium-wire breakages (blinker API + pkg_resources).
+selenium-wire>=5.1
+blinker<1.8
+# selenium-wire needs pkg_resources, which setuptools REMOVED in 81+. Pin below
+# that so the import works ('No module named pkg_resources' otherwise).
+setuptools>=68,<81
+
 # Credential encryption at rest (optional but on by default)
 cryptography>=42.0
 keyring>=24.0

@@ -44,6 +44,10 @@ KEY_PATH: Path = APP_DIR / "secret.key"
 CHROME_PROFILES_DIR: Path = APP_DIR / "chrome_profiles"
 LOG_DIR: Path = APP_DIR / "logs"
 LOG_PATH: Path = LOG_DIR / "app.log"
+# Newly-created accounts from the Sign Up tab are appended here as
+# ``email:password`` lines (a plaintext convenience export you can copy/paste
+# or re-import elsewhere; the encrypted copy still lives in the DB).
+SIGNUPS_PATH: Path = APP_DIR / "signups.txt"
 
 # The site we automate.
 BASE_URL = "https://www.rmfantasysmx.com/"

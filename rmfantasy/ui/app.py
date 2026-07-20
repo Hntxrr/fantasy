@@ -19,25 +19,85 @@ connection (connections are not shareable across threads).
 from __future__ import annotations
 
 import json
+import logging
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
 from dataclasses import asdict
+from pathlib import Path
 from tkinter import messagebox, ttk
 
 import customtkinter as ctk
+
+try:  # Pillow ships with CustomTkinter; guard just in case.
+    from PIL import Image
+except Exception:  # noqa: BLE001
+    Image = None  # type: ignore[assignment]
 
 from .. import automation, config
 from ..assignment import AssignmentPlan, RoundAssignment, build_plan
 from ..repository import Repository
 from ..resolver import RiderResolver
-from ..runner import ConcurrentRunner, RunCallbacks, RunResult
+from ..runner import (
+    ConcurrentRunner,
+    RunCallbacks,
+    RunResult,
+    SigninCallbacks,
+    SigninRunner,
+    SignupCallbacks,
+    SignupRunner,
+    VerifyRunner,
+)
+from ..signup import US_STATE_NAMES, SignupResult
+
+log = logging.getLogger(__name__)
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
 PAD = 8
+
+# --------------------------------------------------------------------------- #
+# RapidMoto brand palette (clean dark UI, blue accent to match the RM logo).
+# --------------------------------------------------------------------------- #
+BG          = "#0b0d12"   # window background
+SURFACE     = "#14161f"   # cards / frames
+SURFACE_2   = "#1a1d28"   # nested surfaces, inputs
+HOVER       = "#20242f"
+BORDER      = "#262a36"
+FG          = "#f2f4f8"   # primary text
+FG_MUTED    = "#9aa3b2"   # secondary text
+FG_FAINT    = "#6b7280"
+
+BRAND       = "#2f6bff"   # RapidMoto blue
+BRAND_HOVER = "#1f5aef"
+SUCCESS     = "#22c55e"
+SUCCESS_HOV = "#1ea34e"
+DANGER      = "#ef4444"
+DANGER_HOV  = "#dc3838"
+WARNING     = "#e0951a"
+WARNING_HOV = "#c98614"
+NEUTRAL     = "#3a3f4b"
+NEUTRAL_HOV = "#474d5b"
+
+# Treeview (ttk) tag colours.
+ROW_OK      = "#5ce08a"
+ROW_FAIL    = "#ff8a8a"
+ROW_BUSY    = "#ffd27f"
+ROW_SKIP    = "#7b828e"
+
+# Asset locations (logo + window/exe icon). Missing files degrade gracefully.
+ASSETS_DIR    = Path(__file__).resolve().parent / "assets"
+LOGO_PATH     = ASSETS_DIR / "logo.png"
+ICON_PNG_PATH = ASSETS_DIR / "icon.png"
+ICON_ICO_PATH = ASSETS_DIR / "icon.ico"
+
+
+def _fmt_account_choice(index: int, account) -> str:
+    """One dropdown line for an account: '12. label  (email)' (1-based)."""
+    return f"{index + 1}. {account.label}  ({account.email})"
 
 
 def _plan_to_dict(plan: AssignmentPlan) -> dict:
@@ -49,6 +109,8 @@ def _plan_to_dict(plan: AssignmentPlan) -> dict:
         "accounts_available": plan.accounts_available,
         "unassigned_pairs": [list(p) for p in plan.unassigned_pairs],
         "idle_accounts": list(plan.idle_accounts),
+        "start_offset": plan.start_offset,
+        "skipped_before": plan.skipped_before,
         "assignments": [asdict(a) for a in plan.assignments],
     }
 
@@ -62,18 +124,184 @@ def _plan_from_dict(d: dict) -> AssignmentPlan:
         accounts_available=d.get("accounts_available", 0),
         unassigned_pairs=[tuple(p) for p in d.get("unassigned_pairs", [])],
         idle_accounts=list(d.get("idle_accounts", [])),
+        start_offset=d.get("start_offset", 0),
+        skipped_before=d.get("skipped_before", 0),
     )
+
+
+class SearchableComboBox(ctk.CTkComboBox):
+    """A CTkComboBox whose dropdown filters as you type.
+
+    Handy for picking from hundreds of accounts: start typing a label, email or
+    the account number and the list narrows. If nothing matches, the full list
+    is kept so you're never stuck. Callers should resolve the *selection* with a
+    tolerant match (exact line, else substring) rather than trusting the raw
+    text, since free typing is allowed.
+    """
+
+    def __init__(self, master, values=None, **kwargs):
+        self._all_values: list[str] = list(values or [])
+        super().__init__(master, values=self._all_values or [""], **kwargs)
+        try:
+            self._entry.bind("<KeyRelease>", self._on_key_release)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def set_values(self, values) -> None:
+        """Replace the full backing list (and what the dropdown shows)."""
+        self._all_values = list(values)
+        self.configure(values=self._all_values or [""])
+
+    def all_values(self) -> list[str]:
+        return list(self._all_values)
+
+    def _on_key_release(self, event) -> None:
+        # Let navigation / commit keys pass through untouched.
+        if event.keysym in ("Up", "Down", "Return", "Escape", "Tab", "Left", "Right"):
+            return
+        typed = self.get().strip().lower()
+        if not typed:
+            filtered = self._all_values
+        else:
+            filtered = [v for v in self._all_values if typed in v.lower()]
+        # Narrow the dropdown; never leave it empty so the arrow still works.
+        self.configure(values=filtered or self._all_values or [""])
+        try:
+            self._open_dropdown_menu()
+            self._entry.focus_set()
+            self._entry.icursor("end")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class ScrollablePicker(ctk.CTkFrame):
+    """A searchable, MOUSE-WHEEL scrollable dropdown for long lists.
+
+    Unlike CTkComboBox (whose dropdown is a native menu you can only nudge with
+    tiny arrows), this opens a popup with a search box and a scrollable list you
+    can spin with the wheel. Same get/set/set_values API as SearchableComboBox.
+    """
+
+    def __init__(self, master, values=None, width=420, placeholder="", **kwargs):
+        super().__init__(master, fg_color="transparent")
+        self._all_values: list[str] = list(values or [])
+        self._popup: tk.Toplevel | None = None
+        self._entry = ctk.CTkEntry(
+            self, placeholder_text=placeholder, fg_color=SURFACE, border_color=BORDER,
+            width=max(80, width - 40),
+        )
+        self._entry.pack(side="left", fill="x", expand=True)
+        self._btn = ctk.CTkButton(
+            self, text="\u25be", width=32, fg_color=BRAND, hover_color=BRAND_HOVER,
+            command=self._open,
+        )
+        self._btn.pack(side="left", padx=(4, 0))
+        self._entry.bind("<Button-1>", lambda e: self._open())
+
+    # Public API (matches SearchableComboBox usage) ------------------- #
+    def set_values(self, values) -> None:
+        self._all_values = list(values)
+
+    def all_values(self) -> list[str]:
+        return list(self._all_values)
+
+    def get(self) -> str:
+        return self._entry.get()
+
+    def set(self, value) -> None:
+        self._entry.delete(0, "end")
+        self._entry.insert(0, value)
+
+    # Popup ----------------------------------------------------------- #
+    def _open(self) -> None:
+        self._close()
+        try:
+            x = self._entry.winfo_rootx()
+            y = self._entry.winfo_rooty() + self._entry.winfo_height() + 2
+            w = max(self.winfo_width(), 340)
+        except Exception:  # noqa: BLE001
+            return
+        pop = tk.Toplevel(self)
+        pop.wm_overrideredirect(True)
+        pop.configure(bg=BORDER)
+        pop.geometry(f"{w}x340+{x}+{y}")
+        self._popup = pop
+
+        search = ctk.CTkEntry(pop, placeholder_text="type to filter...",
+                              fg_color=SURFACE, border_color=BORDER)
+        search.pack(fill="x", padx=4, pady=4)
+        listframe = ctk.CTkScrollableFrame(pop, fg_color=SURFACE)
+        listframe.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+
+        def render(term: str = "") -> None:
+            for child in listframe.winfo_children():
+                child.destroy()
+            t = term.strip().casefold()
+            matches = [v for v in self._all_values if not t or t in v.casefold()]
+            for v in matches[:250]:
+                ctk.CTkButton(
+                    listframe, text=v, anchor="w", height=26, fg_color="transparent",
+                    hover_color=HOVER, text_color=FG,
+                    command=lambda val=v: self._choose(val),
+                ).pack(fill="x", padx=2, pady=1)
+            if len(matches) > 250:
+                ctk.CTkLabel(listframe, text=f"...{len(matches) - 250} more - keep typing",
+                             text_color=FG_MUTED).pack(pady=4)
+            if not matches:
+                ctk.CTkLabel(listframe, text="No matches", text_color=FG_MUTED).pack(pady=6)
+
+        render("")
+        search.bind("<KeyRelease>", lambda e: render(search.get()))
+        pop.bind("<Escape>", lambda e: self._close())
+        # Close when clicking outside the popup.
+        try:
+            pop.grab_set()
+            pop.bind("<Button-1>", self._popup_click)
+        except Exception:  # noqa: BLE001
+            pass
+        search.focus_set()
+
+    def _popup_click(self, event) -> None:
+        pop = self._popup
+        if pop is None:
+            return
+        px, py = pop.winfo_rootx(), pop.winfo_rooty()
+        pw, ph = pop.winfo_width(), pop.winfo_height()
+        if not (px <= event.x_root <= px + pw and py <= event.y_root <= py + ph):
+            self._close()
+
+    def _choose(self, value: str) -> None:
+        self.set(value)
+        self._close()
+
+    def _close(self) -> None:
+        if self._popup is not None:
+            try:
+                self._popup.grab_release()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._popup.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+            self._popup = None
 
 
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("RMFantasySMX Pick Bot")
-        self.geometry("1120x760")
-        self.minsize(960, 640)
+        self.title("RapidMoto - Fantasy Pick Bot")
+        self.geometry("1160x800")
+        self.minsize(980, 660)
+        self.configure(fg_color=BG)
 
         config.ensure_dirs()
         self.repo = Repository()  # main-thread connection
+
+        # Ordered snapshot of all accounts, used by the "Start at account"
+        # dropdown on the This Round tab (kept in sync with refresh_accounts).
+        self._round_accounts: list = []
+        self._logo_image = None  # keep a ref so CTkImage isn't GC'd
 
         # Shared run state.
         self.resolver: RiderResolver | None = None
@@ -82,21 +310,39 @@ class App(ctk.CTk):
         self.events: queue.Queue = queue.Queue()
         self.run_thread: threading.Thread | None = None
         self.scrape_thread: threading.Thread | None = None
+        self.signup_thread: threading.Thread | None = None
+        self.signin_thread: threading.Thread | None = None
+        self.assist_thread: threading.Thread | None = None
         self.runner: ConcurrentRunner | None = None
+        self.signup_runner: SignupRunner | None = None
+        self.signin_runner: SigninRunner | None = None
+        self.assist_runner: SigninRunner | None = None
+        self._su_row_by_email: dict[str, str] = {}
         self._run_row_by_account: dict[int, str] = {}
         self._run_status: dict[int, tuple] = {}   # account_id -> (status_text, tag)
         self._watch_threads: list = []
 
         self._style_treeview()
+        self._apply_window_icon()
+        self._build_header()
 
-        self.tabs = ctk.CTkTabview(self)
-        self.tabs.pack(fill="both", expand=True, padx=PAD, pady=PAD)
+        self.tabs = ctk.CTkTabview(
+            self, fg_color=SURFACE, segmented_button_fg_color=SURFACE_2,
+            segmented_button_selected_color=BRAND,
+            segmented_button_selected_hover_color=BRAND_HOVER,
+            segmented_button_unselected_color=SURFACE_2,
+            segmented_button_unselected_hover_color=HOVER,
+            text_color=FG, border_width=0,
+        )
+        self.tabs.pack(fill="both", expand=True, padx=PAD, pady=(0, PAD))
         self.tabs.add("Accounts")
+        self.tabs.add("Sign Up")
         self.tabs.add("This Round")
         self.tabs.add("Run Picks")
         self.tabs.add("History")
 
         self._build_accounts_tab(self.tabs.tab("Accounts"))
+        self._build_signup_tab(self.tabs.tab("Sign Up"))
         self._build_round_tab(self.tabs.tab("This Round"))
         self._build_run_tab(self.tabs.tab("Run Picks"))
         self._build_history_tab(self.tabs.tab("History"))
@@ -110,6 +356,71 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ================================================================== #
+    # Header / branding
+    # ================================================================== #
+    def _apply_window_icon(self) -> None:
+        """Set the OS window icon from bundled assets (best effort)."""
+        try:
+            if sys.platform.startswith("win") and ICON_ICO_PATH.exists():
+                self.iconbitmap(str(ICON_ICO_PATH))
+            elif ICON_PNG_PATH.exists():
+                self._win_icon = tk.PhotoImage(file=str(ICON_PNG_PATH))
+                self.iconphoto(True, self._win_icon)
+            elif LOGO_PATH.exists():
+                self._win_icon = tk.PhotoImage(file=str(LOGO_PATH))
+                self.iconphoto(True, self._win_icon)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _build_header(self) -> None:
+        """Top branding bar: RM logo + RapidMoto wordmark + tagline."""
+        bar = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=14, height=76)
+        bar.pack(fill="x", padx=PAD, pady=(PAD, PAD))
+        bar.pack_propagate(False)
+
+        left = ctk.CTkFrame(bar, fg_color="transparent")
+        left.pack(side="left", padx=(16, 0), pady=10)
+
+        # Logo image (falls back to a text badge if the asset is missing).
+        logo_added = False
+        if Image is not None and LOGO_PATH.exists():
+            try:
+                img = Image.open(LOGO_PATH)
+                w, h = img.size
+                target_h = 44
+                target_w = max(1, int(w * (target_h / h)))
+                self._logo_image = ctk.CTkImage(
+                    light_image=img, dark_image=img, size=(target_w, target_h)
+                )
+                ctk.CTkLabel(left, image=self._logo_image, text="").pack(side="left")
+                logo_added = True
+            except Exception:  # noqa: BLE001
+                logo_added = False
+        if not logo_added:
+            badge = ctk.CTkLabel(
+                left, text="RM", fg_color=BRAND, corner_radius=8,
+                width=54, height=44, text_color="#ffffff",
+                font=ctk.CTkFont(size=22, weight="bold"),
+            )
+            badge.pack(side="left")
+
+        text_wrap = ctk.CTkFrame(bar, fg_color="transparent")
+        text_wrap.pack(side="left", padx=14, pady=10)
+        ctk.CTkLabel(
+            text_wrap, text="RapidMoto",
+            font=ctk.CTkFont(size=24, weight="bold"), text_color=FG,
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            text_wrap, text="Fantasy SMX  \u2022  automated weekly picks",
+            font=ctk.CTkFont(size=12), text_color=FG_MUTED,
+        ).pack(anchor="w")
+
+        self.header_status = ctk.CTkLabel(
+            bar, text="", font=ctk.CTkFont(size=12), text_color=BRAND,
+        )
+        self.header_status.pack(side="right", padx=18)
+
+    # ================================================================== #
     # Styling
     # ================================================================== #
     def _style_treeview(self) -> None:
@@ -120,11 +431,17 @@ class App(ctk.CTk):
             pass
         style.configure(
             "Treeview",
-            background="#242424", foreground="#e6e6e6", fieldbackground="#242424",
-            rowheight=24, borderwidth=0,
+            background=SURFACE_2, foreground=FG, fieldbackground=SURFACE_2,
+            rowheight=26, borderwidth=0,
         )
-        style.configure("Treeview.Heading", background="#1a1a1a", foreground="#dddddd")
-        style.map("Treeview", background=[("selected", "#2a5d9c")])
+        style.configure(
+            "Treeview.Heading",
+            background=SURFACE, foreground=FG_MUTED,
+            relief="flat", borderwidth=0,
+        )
+        style.map("Treeview.Heading", background=[("active", HOVER)])
+        style.map("Treeview", background=[("selected", BRAND)],
+                  foreground=[("selected", "#ffffff")])
 
     # ================================================================== #
     # Accounts tab
@@ -159,10 +476,18 @@ class App(ctk.CTk):
         right.grid(row=0, column=1, rowspan=4, sticky="nsew", padx=PAD, pady=PAD)
         right.grid_rowconfigure(1, weight=1)
         right.grid_columnconfigure(0, weight=1)
+        header = ctk.CTkFrame(right, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
         self.accounts_count_lbl = ctk.CTkLabel(
-            right, text="Accounts: 0", font=ctk.CTkFont(size=13, weight="bold")
+            header, text="Accounts: 0", font=ctk.CTkFont(size=13, weight="bold")
         )
-        self.accounts_count_lbl.grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        self.accounts_count_lbl.pack(side="left")
+        self.account_search = ctk.CTkEntry(
+            header, placeholder_text="Search email / label...", width=220,
+            fg_color=SURFACE_2, border_color=BORDER,
+        )
+        self.account_search.pack(side="right", padx=(8, 0))
+        self.account_search.bind("<KeyRelease>", lambda e: self.refresh_accounts())
 
         tree_wrap = tk.Frame(right, bg="#242424")
         tree_wrap.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
@@ -177,6 +502,9 @@ class App(ctk.CTk):
         self.accounts_tree.column("#0", width=140)
         self.accounts_tree.column("email", width=240)
         self.accounts_tree.column("session", width=90, anchor="center")
+        # Logged-in accounts are tinted green; ones needing a login are muted.
+        self.accounts_tree.tag_configure("valid", foreground=ROW_OK)
+        self.accounts_tree.tag_configure("invalid", foreground=FG_MUTED)
         vsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.accounts_tree.yview)
         self.accounts_tree.configure(yscrollcommand=vsb.set)
         self.accounts_tree.grid(row=0, column=0, sticky="nsew")
@@ -186,8 +514,81 @@ class App(ctk.CTk):
         acc_btns.grid(row=2, column=0, sticky="ew", padx=6, pady=6)
         ctk.CTkButton(acc_btns, text="Rename / change password",
                       command=self.on_edit_account).pack(side="left", padx=4)
-        ctk.CTkButton(acc_btns, text="Remove selected", fg_color="#8a2c2c",
-                      hover_color="#a13636", command=self.on_remove_account).pack(side="left", padx=4)
+        ctk.CTkButton(acc_btns, text="Remove selected", fg_color=DANGER,
+                      hover_color=DANGER_HOV, command=self.on_remove_account).pack(side="left", padx=4)
+
+        login_btns = ctk.CTkFrame(right, fg_color="transparent")
+        login_btns.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 4))
+        self.assist_login_btn = ctk.CTkButton(
+            login_btns, text="Log in selected (auto-fill)", fg_color=BRAND,
+            hover_color=BRAND_HOVER, command=self.on_assist_login,
+        )
+        self.assist_login_btn.pack(side="left", padx=4)
+        self.reset_login_btn = ctk.CTkButton(
+            login_btns, text="Reset & log in (auto-fill)", fg_color=BRAND,
+            hover_color=BRAND_HOVER, command=self.on_reset_and_login,
+        )
+        self.reset_login_btn.pack(side="left", padx=4)
+        self.assist_stop_btn = ctk.CTkButton(
+            login_btns, text="Stop", fg_color=DANGER, hover_color=DANGER_HOV,
+            width=70, state="disabled", command=self.on_assist_stop,
+        )
+        self.assist_stop_btn.pack(side="left", padx=4)
+        ctk.CTkLabel(login_btns, text="Concurrent:").pack(side="left", padx=(10, 2))
+        self.login_conc_entry = ctk.CTkEntry(login_btns, width=48)
+        self.login_conc_entry.insert(0, "5")
+        self.login_conc_entry.pack(side="left", padx=2)
+
+        signin_btns = ctk.CTkFrame(right, fg_color="transparent")
+        signin_btns.grid(row=4, column=0, sticky="ew", padx=6, pady=(0, 6))
+        self.open_chrome_btn = ctk.CTkButton(
+            signin_btns, text="Open selected in Chrome", fg_color=NEUTRAL,
+            hover_color=NEUTRAL_HOV, command=self.on_open_chrome_login,
+        )
+        self.open_chrome_btn.pack(side="left", padx=4)
+        self.refresh_logins_btn = ctk.CTkButton(
+            signin_btns, text="Refresh login status", fg_color=NEUTRAL,
+            hover_color=NEUTRAL_HOV, command=self.on_refresh_logins,
+        )
+        self.refresh_logins_btn.pack(side="left", padx=4)
+        self.refresh_stop_btn = ctk.CTkButton(
+            signin_btns, text="Stop", fg_color=DANGER, hover_color=DANGER_HOV,
+            width=70, state="disabled", command=self.on_refresh_stop,
+        )
+        self.refresh_stop_btn.pack(side="left", padx=4)
+
+        signin_btns2 = ctk.CTkFrame(right, fg_color="transparent")
+        signin_btns2.grid(row=6, column=0, sticky="ew", padx=6, pady=(0, 6))
+        ctk.CTkButton(
+            signin_btns2, text="Mark selected as logged in", fg_color=SUCCESS,
+            hover_color=SUCCESS_HOV, command=self.on_mark_logged_in,
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            signin_btns2, text="Mark selected as NOT logged in", fg_color=NEUTRAL,
+            hover_color=NEUTRAL_HOV, command=self.on_mark_logged_out,
+        ).pack(side="left", padx=4)
+        self.debug_picks_btn = ctk.CTkButton(
+            signin_btns2, text="Debug picks", fg_color=NEUTRAL,
+            hover_color=NEUTRAL_HOV, command=self.on_debug_picks,
+        )
+        self.debug_picks_btn.pack(side="left", padx=4)
+        self.free_disk_btn = ctk.CTkButton(
+            signin_btns2, text="Free up disk (clear caches)", fg_color=NEUTRAL,
+            hover_color=NEUTRAL_HOV, command=self.on_free_disk,
+        )
+        self.free_disk_btn.pack(side="left", padx=4)
+        self.reset_profile_btn = ctk.CTkButton(
+            signin_btns2, text="Reset profile (fresh login)", fg_color=NEUTRAL,
+            hover_color=NEUTRAL_HOV, command=self.on_reset_profiles,
+        )
+        self.reset_profile_btn.pack(side="left", padx=4)
+        ctk.CTkLabel(
+            right,
+            text=("Tip: 'Log in selected (auto-fill)' fills each login for you - clear the "
+                  "captcha + confirm. Or 'Open selected in Chrome' to do it in a normal "
+                  "window. Then picks reuse the saved session."),
+            text_color=FG_MUTED, wraplength=460, justify="left", font=ctk.CTkFont(size=11),
+        ).grid(row=5, column=0, sticky="ew", padx=6, pady=(0, 4))
 
     def on_import(self) -> None:
         text = self.import_box.get("1.0", "end")
@@ -215,13 +616,33 @@ class App(ctk.CTk):
     def refresh_accounts(self) -> None:
         for iid in self.accounts_tree.get_children():
             self.accounts_tree.delete(iid)
-        accounts = self.repo.list_accounts()
-        for acc in accounts:
+        all_accounts = self.repo.list_accounts()
+        valid_n = sum(1 for a in all_accounts if a.session_valid)
+        term = ""
+        if hasattr(self, "account_search"):
+            term = self.account_search.get().strip().casefold()
+        shown = [
+            a for a in all_accounts
+            if not term or term in a.label.casefold() or term in a.email.casefold()
+        ]
+        for acc in shown:
             self.accounts_tree.insert(
                 "", "end", iid=str(acc.id), text=acc.label,
                 values=(acc.email, "valid" if acc.session_valid else "-"),
+                tags=("valid",) if acc.session_valid else ("invalid",),
             )
-        self.accounts_count_lbl.configure(text=f"Accounts: {len(accounts)}")
+        # Valid (logged-in) accounts are listed first, starting at position 1;
+        # the rest sit below so you can spot and fix the ones not logged in.
+        if term:
+            self.accounts_count_lbl.configure(
+                text=f"Showing {len(shown)} of {len(all_accounts)}   ({valid_n} logged in)"
+            )
+        else:
+            self.accounts_count_lbl.configure(
+                text=f"Accounts: {len(all_accounts)}   ({valid_n} logged in)"
+            )
+        # Keep the "Start at account" dropdown (This Round tab) in sync.
+        self._refresh_start_at_choices()
 
     def _selected_account_id(self) -> int | None:
         sel = self.accounts_tree.selection()
@@ -245,6 +666,660 @@ class App(ctk.CTk):
         acc = self.repo.get_account(acc_id, include_password=False)
         EditAccountDialog(self, acc_id, acc.label, acc.email)
 
+    # --- Log in via your real Chrome, then verify ------------------------ #
+    def _selected_account_ids(self) -> list[int]:
+        return [int(iid) for iid in self.accounts_tree.selection() if iid.isdigit()]
+
+    def on_open_chrome_login(self) -> None:
+        """Open a normal Chrome window per selected account for manual login."""
+        ids = self._selected_account_ids()
+        if not ids:
+            messagebox.showinfo(
+                "No selection",
+                "Select the accounts to log in (Ctrl-click or Shift-click for several).",
+            )
+            return
+        if automation.find_chrome_path() is None:
+            messagebox.showerror(
+                "Chrome not found",
+                "Couldn't find Google Chrome. Install it (or tell me the path to "
+                "chrome.exe) and try again.",
+            )
+            return
+        if len(ids) > 15 and not messagebox.askyesno(
+            "Open many windows?",
+            f"This opens {len(ids)} Chrome windows at once - that's a lot to log "
+            f"into by hand. Continue?",
+        ):
+            return
+        # Gather credentials on the main thread (DB access), then hand off.
+        targets = []
+        for i in ids:
+            acc = self.repo.get_account(i, include_password=True)
+            if acc is not None:
+                targets.append((acc.email, acc.password, acc.profile_dir))
+        self.accounts_status.configure(
+            text=f"Opening {len(targets)} Chrome window(s) - log in, then click 'Refresh login status'."
+        )
+        threading.Thread(target=self._open_chrome_worker, args=(targets,), daemon=True).start()
+
+    def _open_chrome_worker(self, targets) -> None:
+        for email, password, profile_dir in targets:
+            try:
+                landing = automation.build_login_landing(email, password)
+                automation.open_profile_browser(profile_dir, landing)
+            except Exception as exc:  # noqa: BLE001
+                self.events.put(("si_error", str(exc)))
+                return
+            time.sleep(1.5)  # small gap so the windows open cleanly
+        self.events.put(("chrome_opened", len(targets)))
+
+    def on_reset_profiles(self) -> None:
+        """Wipe the Chrome profile(s) for the selected account(s) so they start
+        fresh (fixes accounts whose saved session went stale)."""
+        ids = self._selected_account_ids()
+        if not ids:
+            messagebox.showinfo(
+                "No selection",
+                "Select the account(s) whose profile you want to reset "
+                "(the ones that fail with a refresh).",
+            )
+            return
+        if not messagebox.askyesno(
+            "Reset profile(s)",
+            f"Wipe the Chrome profile for {len(ids)} account(s) and mark them as "
+            "logged out?\n\nThis deletes their saved browser session so the next "
+            "login is completely fresh (like a brand-new browser). It's the fix "
+            "for accounts that show green but refresh/fail on submit. You'll "
+            "re-log-in these accounts afterward (Open in Chrome / auto-fill).",
+        ):
+            return
+        targets = []
+        for i in ids:
+            acc = self.repo.get_account(i, include_password=False)
+            if acc is not None:
+                targets.append((i, acc.profile_dir))
+        self.reset_profile_btn.configure(state="disabled", text="Resetting...")
+        self.accounts_status.configure(text=f"Resetting {len(targets)} profile(s)...")
+        threading.Thread(
+            target=self._reset_profiles_worker, args=(targets, False), daemon=True
+        ).start()
+
+    def on_reset_and_login(self) -> None:
+        """Wipe the selected accounts' profiles AND immediately log them back in
+        with their saved email/password (fresh session)."""
+        if self.assist_thread and self.assist_thread.is_alive():
+            messagebox.showinfo("Busy", "A login run is already in progress.")
+            return
+        ids = self._selected_account_ids()
+        if not ids:
+            messagebox.showinfo(
+                "No selection",
+                "Select the account(s) to reset + log in (you can multi-select).",
+            )
+            return
+        if not messagebox.askyesno(
+            "Reset & log in",
+            f"Wipe the saved browser profile for {len(ids)} account(s) and then log "
+            "them in fresh using their saved email + password?\n\n"
+            "This is the fix for accounts that show green but refresh/fail on submit "
+            "(their stored session went stale). Each browser auto-fills the login - "
+            "clear the captcha if one appears.",
+        ):
+            return
+        targets = []
+        for i in ids:
+            acc = self.repo.get_account(i, include_password=False)
+            if acc is not None:
+                targets.append((i, acc.profile_dir))
+        self.reset_login_btn.configure(state="disabled", text="Resetting...")
+        self.accounts_status.configure(
+            text=f"Resetting {len(targets)} profile(s), then logging in fresh..."
+        )
+        threading.Thread(
+            target=self._reset_profiles_worker, args=(targets, True), daemon=True
+        ).start()
+
+    def _reset_profiles_worker(self, targets, then_login: bool = False) -> None:
+        # Only touch the filesystem here -- DB writes happen on the UI thread
+        # (SQLite connection is single-thread).
+        done_ids = []
+        for acc_id, profile_dir in targets:
+            try:
+                automation.reset_profile(profile_dir)
+                done_ids.append(acc_id)
+            except Exception:  # noqa: BLE001
+                pass
+        self.events.put(("reset_profiles_done", done_ids, then_login))
+
+    def on_free_disk(self) -> None:
+        """Clear regenerable Chrome caches from every profile to reclaim disk
+        space (logins/sessions are preserved)."""
+        if not messagebox.askyesno(
+            "Free up disk space",
+            "Clear the browser CACHE from all Chrome profiles?\n\n"
+            "This reclaims disk space and does NOT log anyone out (cookies and "
+            "sessions are kept). Chrome just rebuilds the cache next time.",
+        ):
+            return
+        self.free_disk_btn.configure(state="disabled", text="Clearing...")
+        self.accounts_status.configure(text="Clearing browser caches...")
+        threading.Thread(target=self._free_disk_worker, daemon=True).start()
+
+    def _free_disk_worker(self) -> None:
+        try:
+            count, freed = automation.prune_all_profile_caches()
+            self.events.put(("free_disk_done", count, freed))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("free_disk_err", str(exc)))
+
+    def on_debug_picks(self) -> None:
+        """Open ONE selected account's picks page and dump it to a file so the
+        exact Submit button + confirmation markup can be shared."""
+        ids = self._selected_account_ids()
+        if not ids:
+            messagebox.showinfo(
+                "No selection",
+                "Select ONE logged-in account, then click 'Debug picks' to dump "
+                "its picks page (buttons, dropdowns, submit + success markers).",
+            )
+            return
+        acc = self.repo.get_account(ids[0], include_password=True)
+        if acc is None:
+            return
+        self.debug_picks_btn.configure(state="disabled", text="Dumping...")
+        self.accounts_status.configure(text="Opening the picks page to dump it...")
+        threading.Thread(
+            target=self._debug_picks_worker, args=(acc.profile_dir,), daemon=True
+        ).start()
+
+    def _debug_picks_worker(self, profile_dir) -> None:
+        try:
+            driver = automation.build_driver(profile_dir, headless=False)
+            try:
+                driver.get(config.BASE_URL)
+                time.sleep(2.0)
+                report = automation.dump_picks_page(driver)
+            finally:
+                automation._hard_close(driver)
+            config.ensure_dirs()
+            path = config.APP_DIR / "picks_page_debug.txt"
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(report)
+            self.events.put(("picks_dump", str(path), report))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("picks_dump_err", str(exc)))
+
+    def on_refresh_logins(self) -> None:
+        """Check which SELECTED accounts have a live session and mark them valid.
+
+        With nothing selected, offers to check every account.
+        """
+        if self.signin_thread and self.signin_thread.is_alive():
+            return
+        ids = self._selected_account_ids()
+        if not ids:
+            total = self.repo.count_accounts()
+            if total == 0:
+                return
+            if not messagebox.askyesno(
+                "No selection",
+                f"No accounts are selected. Check ALL {total} accounts?\n\n"
+                f"This loads each account's page to verify the login (accurate), "
+                f"so it can take a while for many accounts. Tip: select just the "
+                f"accounts you care about to check only those.",
+            ):
+                return
+            ids = [a.id for a in self.repo.list_accounts()]
+        if not ids:
+            return
+        self.refresh_logins_btn.configure(state="disabled", text="Checking...")
+        self.open_chrome_btn.configure(state="disabled")
+        self.refresh_stop_btn.configure(state="normal", text="Stop")
+        self.accounts_status.configure(
+            text=f"Checking login (loading each page - accurate but slower)... 0/{len(ids)}"
+        )
+        # Accurate check: actually loads each profile's page (headless) and looks
+        # for the logged-in vs guest state. Slower than reading cookies, but a
+        # saved cookie doesn't prove a live login -- only loading the page does.
+        self.signin_runner = VerifyRunner(ids, concurrency=6, fast=False)
+        self.signin_thread = threading.Thread(target=self._refresh_logins_worker, args=(ids,), daemon=True)
+        self.signin_thread.start()
+
+    def _refresh_logins_worker(self, ids) -> None:
+        cb = SigninCallbacks(
+            on_result=lambda aid, ok, m: self.events.put(("si_result", aid, ok, m)),
+            on_progress=lambda d, t: self.events.put(("si_progress", d, t)),
+        )
+        try:
+            self.signin_runner.run(cb)
+            self.events.put(("si_done",))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("si_error", str(exc)))
+
+    def on_refresh_stop(self) -> None:
+        if self.signin_runner:
+            self.signin_runner.cancel()
+            self.refresh_stop_btn.configure(state="disabled", text="Stopping...")
+
+    def on_assist_login(self) -> None:
+        """Auto-fill login for selected accounts; you clear the captcha + confirm."""
+        if self.assist_thread and self.assist_thread.is_alive():
+            return
+        ids = self._selected_account_ids()
+        if not ids:
+            messagebox.showinfo("No selection", "Select the accounts to log in.")
+            return
+        self._begin_assist_login(ids)
+
+    def _begin_assist_login(self, ids: list[int]) -> None:
+        """Start the auto-fill (assisted) login flow for the given account ids."""
+        if not ids:
+            return
+        if self.assist_thread and self.assist_thread.is_alive():
+            return
+        try:
+            conc = int(self.login_conc_entry.get() or "5")
+        except Exception:  # noqa: BLE001
+            conc = 5
+        conc = max(1, min(30, conc))
+        try:
+            stagger = float(self.su_stagger_entry.get() or "3")
+        except Exception:  # noqa: BLE001
+            stagger = 3.0
+        proxies = [ln.strip() for ln in self.su_proxy_box.get("1.0", "end").splitlines() if ln.strip()]
+        self.assist_runner = SigninRunner(
+            ids, concurrency=conc, launch_stagger=stagger, proxies=proxies,
+        )
+        self.assist_login_btn.configure(state="disabled", text="Logging in...")
+        self.assist_stop_btn.configure(state="normal", text="Stop")
+        self.accounts_status.configure(
+            text=f"Auto-fill login for {len(ids)} account(s) - clear the captcha + confirm in each window."
+        )
+        self.assist_thread = threading.Thread(target=self._assist_worker, args=(ids,), daemon=True)
+        self.assist_thread.start()
+
+    def _assist_worker(self, ids: list[int]) -> None:
+        cb = SigninCallbacks(
+            on_task_start=lambda aid: self.events.put(("sl_status", aid, "Opening browser...")),
+            on_status=lambda aid, m: self.events.put(("sl_status", aid, m)),
+            on_result=lambda aid, ok, m: self.events.put(("sl_result", aid, ok, m)),
+            on_progress=lambda d, t: self.events.put(("sl_progress", d, t)),
+        )
+        try:
+            self.assist_runner.run(cb)
+            self.events.put(("sl_done",))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("sl_error", str(exc)))
+
+    def on_assist_stop(self) -> None:
+        if self.assist_runner:
+            self.assist_runner.cancel()
+            self.assist_stop_btn.configure(state="disabled", text="Stopping...")
+
+    def on_mark_logged_in(self) -> None:
+        """Instantly flag selected accounts as logged in (no check)."""
+        ids = self._selected_account_ids()
+        if not ids:
+            messagebox.showinfo("No selection", "Select the accounts to mark as logged in.")
+            return
+        for aid in ids:
+            self.repo.set_session_valid(aid, True)
+        self.refresh_accounts()
+        self.accounts_status.configure(text=f"Marked {len(ids)} account(s) as logged in.")
+
+    def on_mark_logged_out(self) -> None:
+        """Instantly flag selected accounts as NOT logged in (no check)."""
+        ids = self._selected_account_ids()
+        if not ids:
+            messagebox.showinfo("No selection", "Select the accounts to mark as not logged in.")
+            return
+        for aid in ids:
+            self.repo.set_session_valid(aid, False)
+        self.refresh_accounts()
+        self.accounts_status.configure(text=f"Marked {len(ids)} account(s) as not logged in.")
+
+    # ================================================================== #
+    # Sign Up tab
+    # ================================================================== #
+    def _build_signup_tab(self, tab) -> None:
+        tab.grid_columnconfigure(0, weight=3)
+        tab.grid_columnconfigure(1, weight=2)
+        tab.grid_rowconfigure(1, weight=1)
+
+        # --- Left: emails to register ------------------------------------ #
+        ctk.CTkLabel(
+            tab, text="Emails to sign up  (one per line)",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=PAD, pady=(PAD, 0))
+        self.signup_emails_box = ctk.CTkTextbox(tab, fg_color=SURFACE_2)
+        self.signup_emails_box.grid(row=1, column=0, sticky="nsew", padx=PAD, pady=PAD)
+        self.signup_emails_box.insert("1.0", "# one email per line\n")
+
+        # --- Right: shared mailing address ------------------------------- #
+        addr = ctk.CTkFrame(tab, fg_color=SURFACE_2, corner_radius=12)
+        addr.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=PAD, pady=(PAD, PAD))
+        addr.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            addr, text="Mailing address  (shared by all)",
+            font=ctk.CTkFont(size=13, weight="bold"), text_color=FG,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(12, 6))
+
+        ctk.CTkLabel(addr, text="Street:", text_color=FG_MUTED).grid(row=1, column=0, sticky="w", padx=(14, 6), pady=5)
+        ctk.CTkLabel(
+            addr, text="\U0001F3B2 randomized each account", text_color=BRAND, anchor="w",
+        ).grid(row=1, column=1, sticky="ew", padx=(0, 14), pady=5)
+
+        ctk.CTkLabel(addr, text="City:", text_color=FG_MUTED).grid(row=2, column=0, sticky="w", padx=(14, 6), pady=5)
+        self.su_city = ctk.CTkEntry(addr, fg_color=SURFACE, border_color=BORDER)
+        self.su_city.grid(row=2, column=1, sticky="ew", padx=(0, 14), pady=5)
+
+        ctk.CTkLabel(addr, text="State:", text_color=FG_MUTED).grid(row=3, column=0, sticky="w", padx=(14, 6), pady=5)
+        self.su_state = SearchableComboBox(
+            addr, values=list(US_STATE_NAMES),
+            fg_color=SURFACE, button_color=BRAND, button_hover_color=BRAND_HOVER,
+            border_color=BORDER, dropdown_fg_color=SURFACE,
+            dropdown_hover_color=HOVER, dropdown_text_color=FG,
+        )
+        self.su_state.set("")
+        self.su_state.grid(row=3, column=1, sticky="ew", padx=(0, 14), pady=5)
+
+        ctk.CTkLabel(addr, text="Postal code:", text_color=FG_MUTED).grid(row=4, column=0, sticky="w", padx=(14, 6), pady=5)
+        self.su_postal = ctk.CTkEntry(addr, fg_color=SURFACE, border_color=BORDER)
+        self.su_postal.grid(row=4, column=1, sticky="ew", padx=(0, 14), pady=5)
+
+        ctk.CTkLabel(addr, text="Country:", text_color=FG_MUTED).grid(row=5, column=0, sticky="w", padx=(14, 6), pady=5)
+        self.su_country = ctk.CTkEntry(addr, fg_color=SURFACE, border_color=BORDER)
+        self.su_country.insert(0, "United States")
+        self.su_country.grid(row=5, column=1, sticky="ew", padx=(0, 14), pady=5)
+
+        ctk.CTkLabel(
+            addr,
+            text=("First/last name, phone, nickname and password are generated "
+                  "randomly for each email, and \u201cI am 18 or older\u201d is "
+                  "ticked automatically."),
+            text_color=FG_MUTED, wraplength=300, justify="left",
+        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=14, pady=(8, 12))
+
+        # --- Options ----------------------------------------------------- #
+        opts = ctk.CTkFrame(tab, fg_color=SURFACE)
+        opts.grid(row=2, column=0, columnspan=2, sticky="ew", padx=PAD, pady=(0, PAD))
+        opts.grid_columnconfigure(9, weight=1)
+
+        ctk.CTkLabel(opts, text="Concurrent browsers:").grid(row=0, column=0, padx=(8, 4), pady=8)
+        self.su_conc_value = ctk.CTkLabel(opts, text="1", width=28)
+        self.su_conc_slider = ctk.CTkSlider(
+            opts, from_=1, to=10, number_of_steps=9, width=140,
+            command=lambda v: self.su_conc_value.configure(text=str(int(v))),
+        )
+        self.su_conc_slider.set(1)
+        self.su_conc_slider.grid(row=0, column=1, padx=4)
+        self.su_conc_value.grid(row=0, column=2, padx=(0, 12))
+
+        ctk.CTkLabel(opts, text="Launch stagger (s):").grid(row=0, column=3, padx=(8, 4))
+        self.su_stagger_entry = ctk.CTkEntry(opts, width=54)
+        self.su_stagger_entry.insert(0, "6")
+        self.su_stagger_entry.grid(row=0, column=4, padx=4)
+
+        ctk.CTkLabel(opts, text="Keep open after submit (s):").grid(row=0, column=5, padx=(8, 4))
+        self.su_keepopen_entry = ctk.CTkEntry(opts, width=48)
+        self.su_keepopen_entry.insert(0, "5")
+        self.su_keepopen_entry.grid(row=0, column=6, padx=4)
+
+        ctk.CTkLabel(opts, text="Submit attempts:").grid(row=0, column=7, padx=(8, 4))
+        self.su_attempts_entry = ctk.CTkEntry(opts, width=48)
+        self.su_attempts_entry.insert(0, "8")
+        self.su_attempts_entry.grid(row=0, column=8, padx=4)
+
+        self.su_assist_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            opts, text="Assist mode (I click Submit + captcha)",
+            variable=self.su_assist_var,
+        ).grid(row=0, column=9, padx=12, sticky="e")
+
+        self.su_headless_var = ctk.BooleanVar(value=False)
+
+        ctk.CTkLabel(opts, text="Proxies (one per line: host:port OR host:port:user:pass; round-robin):"
+                     ).grid(row=1, column=0, columnspan=8, sticky="w", padx=8, pady=(4, 0))
+        self.su_proxy_box = ctk.CTkTextbox(opts, height=44, fg_color=SURFACE_2)
+        self.su_proxy_box.grid(row=2, column=0, columnspan=8, sticky="ew", padx=8, pady=(0, 8))
+
+        ctk.CTkLabel(
+            opts,
+            text=("Assist mode (recommended): the form is auto-filled and scrolled to "
+                  "Submit; YOU click Submit and clear the site's captcha, then click "
+                  "'Account created' in the little box in the browser - it saves the "
+                  "account and closes. Keep concurrency low (1-2) so you can handle "
+                  "each browser."),
+            text_color=FG_MUTED, wraplength=1040, justify="left",
+        ).grid(row=3, column=0, columnspan=8, sticky="w", padx=8, pady=(0, 8))
+
+        # --- Actions ----------------------------------------------------- #
+        actions = ctk.CTkFrame(tab, fg_color="transparent")
+        actions.grid(row=3, column=0, columnspan=2, sticky="ew", padx=PAD)
+        self.signup_btn = ctk.CTkButton(
+            actions, text="SIGN UP ALL", fg_color=SUCCESS, hover_color=SUCCESS_HOV,
+            height=40, width=140, font=ctk.CTkFont(size=15, weight="bold"),
+            command=self.on_signup_run,
+        )
+        self.signup_btn.pack(side="left", padx=4)
+        self.signup_stop_btn = ctk.CTkButton(
+            actions, text="STOP", fg_color=DANGER, hover_color=DANGER_HOV,
+            height=40, width=80, state="disabled", command=self.on_signup_stop,
+        )
+        self.signup_stop_btn.pack(side="left", padx=4)
+        self.test_proxy_btn = ctk.CTkButton(
+            actions, text="Test proxy", fg_color=NEUTRAL, hover_color=NEUTRAL_HOV,
+            height=40, width=100, command=self.on_test_proxy,
+        )
+        self.test_proxy_btn.pack(side="left", padx=4)
+        self.debug_form_btn = ctk.CTkButton(
+            actions, text="Debug form", fg_color=NEUTRAL, hover_color=NEUTRAL_HOV,
+            height=40, width=100, command=self.on_debug_form,
+        )
+        self.debug_form_btn.pack(side="left", padx=4)
+        self.signup_progress = ctk.CTkProgressBar(actions, width=220)
+        self.signup_progress.set(0)
+        self.signup_progress.pack(side="left", padx=12)
+        self.signup_progress_lbl = ctk.CTkLabel(actions, text="0 / 0")
+        self.signup_progress_lbl.pack(side="left")
+
+        self.signup_status_lbl = ctk.CTkLabel(
+            tab, text=f"Saved logins are written to: {config.SIGNUPS_PATH}",
+            anchor="w", text_color=FG_MUTED,
+        )
+        self.signup_status_lbl.grid(row=4, column=0, columnspan=2, sticky="ew", padx=PAD, pady=(6, 0))
+
+        # --- Results table ----------------------------------------------- #
+        wrap = tk.Frame(tab, bg=SURFACE_2)
+        wrap.grid(row=5, column=0, columnspan=2, sticky="nsew", padx=PAD, pady=PAD)
+        tab.grid_rowconfigure(5, weight=1)
+        wrap.grid_rowconfigure(0, weight=1)
+        wrap.grid_columnconfigure(0, weight=1)
+        cols = ("email", "status")
+        self.signup_tree = ttk.Treeview(wrap, columns=cols, show="headings")
+        self.signup_tree.heading("email", text="Email")
+        self.signup_tree.heading("status", text="Status")
+        self.signup_tree.column("email", width=300, anchor="w")
+        self.signup_tree.column("status", width=560, anchor="w")
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.signup_tree.yview)
+        self.signup_tree.configure(yscrollcommand=vsb.set)
+        self.signup_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        self.signup_tree.tag_configure("ok", foreground=ROW_OK)
+        self.signup_tree.tag_configure("fail", foreground=ROW_FAIL)
+        self.signup_tree.tag_configure("busy", foreground=ROW_BUSY)
+        self.signup_tree.tag_configure("skip", foreground=ROW_SKIP)
+
+    def _parse_signup_emails(self) -> list[str]:
+        """Emails from the box: strip, drop blanks/#comments, dedupe, need '@'."""
+        out, seen = [], set()
+        for raw in self.signup_emails_box.get("1.0", "end").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            key = line.casefold()
+            if "@" not in line or key in seen:
+                continue
+            seen.add(key)
+            out.append(line)
+        return out
+
+    def _su_update_row(self, email: str, status: str, tag: str) -> None:
+        iid = self._su_row_by_email.get(email)
+        if iid and self.signup_tree.exists(iid):
+            self.signup_tree.set(iid, "status", status)
+            self.signup_tree.item(iid, tags=(tag,) if tag else ())
+
+    def on_signup_run(self) -> None:
+        if self.signup_thread and self.signup_thread.is_alive():
+            return
+        emails = self._parse_signup_emails()
+        if not emails:
+            messagebox.showwarning("No emails", "Paste at least one email (one per line).")
+            return
+        state = self.su_state.get().strip()
+        if not state and not messagebox.askyesno(
+            "No state selected",
+            "No state is selected. The site usually requires one and the "
+            "signups may fail.\n\nContinue anyway?",
+        ):
+            return
+
+        # Populate the results table.
+        for iid in self.signup_tree.get_children():
+            self.signup_tree.delete(iid)
+        self._su_row_by_email.clear()
+        for email in emails:
+            iid = f"su::{email}"
+            self._su_row_by_email[email] = iid
+            self.signup_tree.insert("", "end", iid=iid, values=(email, "Pending"), tags=())
+
+        try:
+            stagger = float(self.su_stagger_entry.get() or "6")
+        except ValueError:
+            stagger = 6.0
+        try:
+            keep_open = float(self.su_keepopen_entry.get() or "5")
+        except ValueError:
+            keep_open = 5.0
+        try:
+            attempts = int(self.su_attempts_entry.get() or "8")
+        except ValueError:
+            attempts = 8
+        proxies = [ln.strip() for ln in self.su_proxy_box.get("1.0", "end").splitlines() if ln.strip()]
+
+        self.signup_runner = SignupRunner(
+            city=self.su_city.get().strip(),
+            state=state,
+            postal_code=self.su_postal.get().strip(),
+            country=self.su_country.get().strip() or "United States",
+            concurrency=int(self.su_conc_slider.get()),
+            headless=self.su_headless_var.get(),
+            launch_stagger=stagger,
+            proxies=proxies,
+            post_submit_dwell=keep_open,
+            submit_attempts=attempts,
+            assist=self.su_assist_var.get(),
+        )
+        self.signup_progress.set(0)
+        self.signup_progress_lbl.configure(text=f"0 / {len(emails)}")
+        self._set_signup_running(True)
+        self.signup_thread = threading.Thread(
+            target=self._signup_worker, args=(emails,), daemon=True
+        )
+        self.signup_thread.start()
+
+    def _signup_worker(self, emails: list[str]) -> None:
+        cb = SignupCallbacks(
+            on_task_start=lambda e: self.events.put(("su_task_start", e)),
+            on_status=lambda e, m: self.events.put(("su_status", e, m)),
+            on_result=lambda r: self.events.put(("su_result", r)),
+            on_progress=lambda d, t: self.events.put(("su_progress", d, t)),
+        )
+        try:
+            self.signup_runner.run(emails, cb)
+            self.events.put(("su_run_done",))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("su_run_error", str(exc)))
+
+    def on_signup_stop(self) -> None:
+        if self.signup_runner:
+            self.signup_runner.cancel()
+            self.signup_stop_btn.configure(state="disabled", text="Stopping...")
+
+    def on_test_proxy(self) -> None:
+        """Open a browser through the first proxy and report its public IP."""
+        proxies = [ln.strip() for ln in self.su_proxy_box.get("1.0", "end").splitlines() if ln.strip()]
+        proxy = proxies[0] if proxies else None
+        if not proxy:
+            messagebox.showinfo(
+                "No proxy", "Add a proxy line first (host:port or host:port:user:pass).")
+            return
+        self.test_proxy_btn.configure(state="disabled", text="Testing...")
+        self.signup_status_lbl.configure(text=f"Opening browser through proxy {proxy.split(':')[0]}...")
+        threading.Thread(target=self._test_proxy_worker, args=(proxy,), daemon=True).start()
+
+    def _test_proxy_worker(self, proxy: str) -> None:
+        import tempfile
+        prof = tempfile.mkdtemp(prefix="rm_proxytest_")
+        try:
+            driver = automation.build_driver(prof, headless=False, proxy=proxy)
+            try:
+                ip = automation.get_public_ip(driver)
+            finally:
+                try:
+                    driver.quit()
+                except Exception:  # noqa: BLE001
+                    pass
+            self.events.put(("proxy_ip", ip or "(could not read IP)"))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("proxy_err", str(exc)))
+
+    def on_debug_form(self) -> None:
+        """Open the signup modal and dump its buttons/fields to a file."""
+        proxies = [ln.strip() for ln in self.su_proxy_box.get("1.0", "end").splitlines() if ln.strip()]
+        proxy = proxies[0] if proxies else None
+        self.debug_form_btn.configure(state="disabled", text="Dumping...")
+        self.signup_status_lbl.configure(text="Opening sign-up form to dump its fields...")
+        threading.Thread(target=self._debug_form_worker, args=(proxy,), daemon=True).start()
+
+    def _debug_form_worker(self, proxy) -> None:
+        import tempfile
+        prof = tempfile.mkdtemp(prefix="rm_debugform_")
+        try:
+            driver = automation.build_driver(prof, headless=False, proxy=proxy)
+            try:
+                driver.get(config.BASE_URL)
+                automation._open_signup_modal(driver, timeout=30)
+                time.sleep(1.0)
+                report = automation.dump_signup_form(driver)
+            finally:
+                try:
+                    driver.quit()
+                except Exception:  # noqa: BLE001
+                    pass
+            config.ensure_dirs()
+            path = config.APP_DIR / "signup_form_debug.txt"
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(report)
+            self.events.put(("debug_dump", str(path), report))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("debug_err", str(exc)))
+
+    def _set_signup_running(self, running: bool) -> None:
+        self.signup_btn.configure(state="disabled" if running else "normal")
+        self.signup_stop_btn.configure(state="normal" if running else "disabled", text="STOP")
+
+    def _append_signup_file(self, email: str, password: str) -> None:
+        """Append one email:password line to the signups export (main thread)."""
+        try:
+            config.ensure_dirs()
+            with open(config.SIGNUPS_PATH, "a", encoding="utf-8") as fh:
+                fh.write(f"{email}:{password}\n")
+        except Exception:  # noqa: BLE001
+            log.exception("Could not write to signups file")
+
     # ================================================================== #
     # This Round tab
     # ================================================================== #
@@ -265,25 +1340,106 @@ class App(ctk.CTk):
         self.wildcards_box = ctk.CTkTextbox(tab)
         self.wildcards_box.grid(row=1, column=1, sticky="nsew", padx=PAD, pady=PAD)
 
+        # --- Start-at-account chooser -------------------------------- #
+        start_card = ctk.CTkFrame(tab, fg_color=SURFACE_2, corner_radius=12)
+        start_card.grid(row=2, column=0, columnspan=2, sticky="ew", padx=PAD, pady=(0, 4))
+        start_card.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            start_card, text="Start at account:",
+            font=ctk.CTkFont(size=13, weight="bold"), text_color=FG,
+        ).grid(row=0, column=0, padx=(14, 8), pady=10, sticky="w")
+        self.start_at_combo = ScrollablePicker(
+            start_card, values=[], width=440, placeholder="click / type to pick a start account",
+        )
+        self.start_at_combo.grid(row=0, column=1, padx=4, pady=10, sticky="ew")
+        ctk.CTkButton(
+            start_card, text="First account", width=110, fg_color=NEUTRAL,
+            hover_color=NEUTRAL_HOV, command=self.on_start_at_first,
+        ).grid(row=0, column=2, padx=(4, 14), pady=10)
+        ctk.CTkLabel(
+            start_card,
+            text=("The round assigns from this account and goes DOWN the list. "
+                  "Pick any account you own to skip ones already used in a "
+                  "previous round (type to search)."),
+            text_color=FG_MUTED, wraplength=1040, justify="left",
+        ).grid(row=1, column=0, columnspan=3, padx=14, pady=(0, 10), sticky="w")
+
         controls = ctk.CTkFrame(tab, fg_color="transparent")
-        controls.grid(row=2, column=0, columnspan=2, sticky="ew", padx=PAD)
+        controls.grid(row=3, column=0, columnspan=2, sticky="ew", padx=PAD)
         self.scrape_btn = ctk.CTkButton(controls, text="Scrape riders from site",
+                                        fg_color=NEUTRAL, hover_color=NEUTRAL_HOV,
                                         command=self.on_scrape_roster)
         self.scrape_btn.pack(side="left", padx=4)
-        ctk.CTkButton(controls, text="Resolve & preview", command=self.on_resolve).pack(side="left", padx=4)
-        ctk.CTkButton(controls, text="Fix ambiguous names", fg_color="#7a5a1e",
-                      hover_color="#8f6a26", command=self.on_fix_ambiguous).pack(side="left", padx=4)
-        ctk.CTkButton(controls, text="Lock in assignments", fg_color="#2c6e49",
-                      hover_color="#358257", command=self.on_lock_plan).pack(side="left", padx=4)
-        self.roster_lbl = ctk.CTkLabel(controls, text="Roster: (not scraped)")
+        ctk.CTkButton(controls, text="Resolve & preview", fg_color=BRAND,
+                      hover_color=BRAND_HOVER, command=self.on_resolve).pack(side="left", padx=4)
+        ctk.CTkButton(controls, text="Fix ambiguous names", fg_color=WARNING,
+                      hover_color=WARNING_HOV, command=self.on_fix_ambiguous).pack(side="left", padx=4)
+        ctk.CTkButton(controls, text="Lock in assignments", fg_color=SUCCESS,
+                      hover_color=SUCCESS_HOV, command=self.on_lock_plan).pack(side="left", padx=4)
+        self.roster_lbl = ctk.CTkLabel(controls, text="Roster: (not scraped)", text_color=FG_MUTED)
         self.roster_lbl.pack(side="left", padx=12)
 
-        self.round_summary = ctk.CTkLabel(tab, text="", anchor="w", text_color="#d0d0ff")
-        self.round_summary.grid(row=3, column=0, columnspan=2, sticky="ew", padx=PAD)
+        self.round_summary = ctk.CTkLabel(tab, text="", anchor="w", text_color=BRAND)
+        self.round_summary.grid(row=4, column=0, columnspan=2, sticky="ew", padx=PAD)
 
-        self.preview_box = ctk.CTkTextbox(tab, height=170)
-        self.preview_box.grid(row=4, column=0, columnspan=2, sticky="ew", padx=PAD, pady=PAD)
+        self.preview_box = ctk.CTkTextbox(tab, height=170, fg_color=SURFACE_2)
+        self.preview_box.grid(row=5, column=0, columnspan=2, sticky="ew", padx=PAD, pady=PAD)
         self.preview_box.configure(state="disabled")
+
+    # --- Start-at-account helpers ------------------------------------ #
+    def _refresh_start_at_choices(self) -> None:
+        """Sync the This Round 'Start at account' dropdown with all accounts."""
+        if not hasattr(self, "start_at_combo"):
+            return
+        self._round_accounts = self.repo.list_accounts()
+        choices = [_fmt_account_choice(i, a) for i, a in enumerate(self._round_accounts)]
+        prev = self.start_at_combo.get()
+        self.start_at_combo.set_values(choices)
+        # Keep the current selection if still valid; otherwise restore the
+        # persisted start account (by id); otherwise default to the first.
+        if prev in choices:
+            self.start_at_combo.set(prev)
+            return
+        persisted = self.repo.get_meta("round_start_account_id")
+        if persisted:
+            try:
+                pid = int(persisted)
+                for i, a in enumerate(self._round_accounts):
+                    if a.id == pid:
+                        self.start_at_combo.set(choices[i])
+                        return
+            except (ValueError, TypeError):
+                pass
+        if choices:
+            self.start_at_combo.set(choices[0])
+        else:
+            self.start_at_combo.set("")
+
+    def _selected_start_offset(self) -> int:
+        """0-based index into the full accounts list for the chosen start.
+
+        Tolerant: matches the exact dropdown line first, then a substring
+        (label / email / number the user typed), else defaults to 0.
+        """
+        accounts = self._round_accounts or self.repo.list_accounts()
+        self._round_accounts = accounts
+        if not accounts:
+            return 0
+        val = self.start_at_combo.get().strip().lower() if hasattr(self, "start_at_combo") else ""
+        if not val:
+            return 0
+        choices = [_fmt_account_choice(i, a).lower() for i, a in enumerate(accounts)]
+        for i, c in enumerate(choices):
+            if c == val:
+                return i
+        for i, c in enumerate(choices):
+            if val in c:
+                return i
+        return 0
+
+    def on_start_at_first(self) -> None:
+        if self._round_accounts:
+            self.start_at_combo.set(_fmt_account_choice(0, self._round_accounts[0]))
 
     def _parse_lineups(self) -> list[list[str]]:
         lines = [ln.strip() for ln in self.lineups_box.get("1.0", "end").splitlines() if ln.strip()]
@@ -370,9 +1526,11 @@ class App(ctk.CTk):
                 lines.append(f"{w} -> [{flag}: {r.name or '?'}{(' / ' + alts) if alts else ''}]")
                 resolved_wildcards.append(r.name or f"?{w}")
 
-        # Assignment math preview.
+        # Assignment math preview (honours the chosen start account).
         accounts = self.repo.list_accounts()
-        plan = build_plan(resolved_lineups, resolved_wildcards, accounts)
+        self._round_accounts = accounts
+        start_offset = self._selected_start_offset()
+        plan = build_plan(resolved_lineups, resolved_wildcards, accounts, start_offset)
         self.round_summary.configure(text=plan.summary())
         self._pending_resolved = (resolved_lineups, resolved_wildcards)
 
@@ -427,32 +1585,34 @@ class App(ctk.CTk):
         if not accounts:
             messagebox.showwarning("No accounts", "Import accounts before locking in a plan.")
             return
-        self.plan = build_plan(resolved_lineups, resolved_wildcards, accounts)
+        self._round_accounts = accounts
+        start_offset = self._selected_start_offset()
+        self.plan = build_plan(resolved_lineups, resolved_wildcards, accounts, start_offset)
         self._run_status = {}
+        # The Run Picks "begin at" dropdown is a within-plan skip; reset to row 1.
         self._persist_round()
         self._persist_plan()
         self._persist_status()
         self._populate_run_table()
+        self._set_run_start_position(1)
 
-        # Ask which account position to start from (1 = first, default).
-        # This just sets the same "Start from account #" field on Run Picks,
-        # which you can still change there before running.
-        dlg = StartFromDialog(self, max_n=self.plan.assigned_count, default=1)
-        self.wait_window(dlg)
-        start = dlg.result if dlg.result is not None else 1
-        self.start_entry.delete(0, "end")
-        self.start_entry.insert(0, str(start))
-
+        start_label = ""
+        if self.plan.assignments:
+            first = self.plan.assignments[0]
+            start_label = (f"\nFirst account: #{self.plan.start_offset + 1} "
+                           f"{first.account_label} ({first.account_email}).")
         warn = ""
         if self.plan.unassigned_pairs:
-            warn = f"\n\nWARNING: {len(self.plan.unassigned_pairs)} pairs have no account (need more accounts)."
+            warn = (f"\n\nWARNING: {len(self.plan.unassigned_pairs)} pairs have no "
+                    f"account from the start point onward (add more accounts or "
+                    f"start higher up the list).")
         if self.plan.idle_accounts:
             warn += f"\n{len(self.plan.idle_accounts)} accounts will be idle."
         messagebox.showinfo(
             "Plan locked in",
-            f"{self.plan.assigned_count} account submissions ready.\n"
-            f"Run starts at account #{start} - each account submits its own "
-            f"assigned lineup + wildcard.{warn}\n\nGo to the 'Run Picks' tab.",
+            f"{self.plan.assigned_count} account submissions ready."
+            f"{start_label}\nEach account submits its own assigned lineup + "
+            f"wildcard, going down the list.{warn}\n\nGo to the 'Run Picks' tab.",
         )
         self.tabs.set("Run Picks")
 
@@ -521,15 +1681,19 @@ class App(ctk.CTk):
         ctk.CTkCheckBox(opts, text="Headless", variable=self.headless_var
                         ).grid(row=0, column=7, padx=12, sticky="e")
 
-        ctk.CTkLabel(opts, text="Start from account #:").grid(row=1, column=0, padx=(8, 4), pady=(0, 6), sticky="w")
-        self.start_entry = ctk.CTkEntry(opts, width=70)
-        self.start_entry.insert(0, "1")
-        self.start_entry.grid(row=1, column=1, padx=4, pady=(0, 6), sticky="w")
-        ctk.CTkButton(opts, text="Set from selected row", width=150,
-                      command=self.on_set_start_from_selected
-                      ).grid(row=1, column=2, columnspan=2, padx=4, pady=(0, 6), sticky="w")
-        ctk.CTkLabel(opts, text="(skips rows above this position; each account still submits its own assigned lineup + wildcard)",
-                     text_color="#9aa").grid(row=1, column=4, columnspan=4, padx=4, pady=(0, 6), sticky="w")
+        ctk.CTkLabel(opts, text="Begin run at:").grid(row=1, column=0, padx=(8, 4), pady=(0, 6), sticky="w")
+        self.start_combo = SearchableComboBox(
+            opts, values=[], width=300,
+            fg_color=SURFACE, button_color=BRAND, button_hover_color=BRAND_HOVER,
+            border_color=BORDER, dropdown_fg_color=SURFACE,
+            dropdown_hover_color=HOVER, dropdown_text_color=FG,
+        )
+        self.start_combo.grid(row=1, column=1, columnspan=2, padx=4, pady=(0, 6), sticky="w")
+        ctk.CTkButton(opts, text="Set from selected row", width=150, fg_color=NEUTRAL,
+                      hover_color=NEUTRAL_HOV, command=self.on_set_start_from_selected
+                      ).grid(row=1, column=3, padx=4, pady=(0, 6), sticky="w")
+        ctk.CTkLabel(opts, text="(skips rows above this one; each account still submits its own assigned lineup + wildcard)",
+                     text_color=FG_MUTED).grid(row=1, column=4, columnspan=4, padx=4, pady=(0, 6), sticky="w")
 
         ctk.CTkLabel(opts, text="Proxies (one host:port per line, optional; round-robin):"
                      ).grid(row=2, column=0, columnspan=8, sticky="w", padx=8)
@@ -562,6 +1726,10 @@ class App(ctk.CTk):
         self.watch_btn = ctk.CTkButton(actions, text="\U0001F441 Watch selected", width=140, height=40,
                                        command=self.on_watch_selected)
         self.watch_btn.pack(side="left", padx=4)
+        self.run_reset_login_btn = ctk.CTkButton(actions, text="Reset & log in", fg_color="#3a6ea5",
+                                                 hover_color="#4880bd", height=40, width=120,
+                                                 command=self.on_run_reset_and_login)
+        self.run_reset_login_btn.pack(side="left", padx=4)
         self.reset_btn = ctk.CTkButton(actions, text="Reset round", fg_color="#555555",
                                        hover_color="#666666", height=40, width=100,
                                        command=self.on_reset_round)
@@ -602,6 +1770,7 @@ class App(ctk.CTk):
             self.run_tree.delete(iid)
         self._run_row_by_account.clear()
         if not self.plan:
+            self._refresh_run_start_choices()
             return
         for pos, a in enumerate(self.plan.assignments, 1):
             iid = f"acc{a.account_id}"
@@ -614,6 +1783,53 @@ class App(ctk.CTk):
                 values=(pos, a.account_label, f"#{a.lineup_index}", a.wildcard, status_text),
                 tags=(tag,) if tag else (),
             )
+        self._refresh_run_start_choices()
+
+    # --- Run-start (within-plan skip) helpers ------------------------ #
+    def _run_start_choices(self) -> list[str]:
+        if not self.plan:
+            return []
+        return [f"{i + 1}. {a.account_label}  ({a.account_email})"
+                for i, a in enumerate(self.plan.assignments)]
+
+    def _refresh_run_start_choices(self) -> None:
+        if not hasattr(self, "start_combo"):
+            return
+        choices = self._run_start_choices()
+        prev = self.start_combo.get()
+        self.start_combo.set_values(choices)
+        if prev in choices:
+            self.start_combo.set(prev)
+        elif choices:
+            self.start_combo.set(choices[0])
+        else:
+            self.start_combo.set("")
+
+    def _set_run_start_position(self, pos: int) -> None:
+        """Select the given 1-based plan position in the Run Picks dropdown."""
+        if not hasattr(self, "start_combo"):
+            return
+        choices = self.start_combo.all_values() or self._run_start_choices()
+        if 1 <= pos <= len(choices):
+            self.start_combo.set(choices[pos - 1])
+        elif choices:
+            self.start_combo.set(choices[0])
+
+    def _selected_run_start_position(self) -> int:
+        """Parse the 1-based plan position from the Run Picks dropdown value."""
+        if not hasattr(self, "start_combo"):
+            return 1
+        val = self.start_combo.get().strip()
+        digits = ""
+        for ch in val:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        try:
+            return max(1, int(digits))
+        except ValueError:
+            return 1
 
     def _read_run_options(self):
         try:
@@ -634,10 +1850,7 @@ class App(ctk.CTk):
             messagebox.showwarning("No plan", "Lock in a plan on the 'This Round' tab first.")
             return
         assignments = list(self.plan.assignments)
-        try:
-            start = int(self.start_entry.get() or "1")
-        except ValueError:
-            start = 1
+        start = self._selected_run_start_position()
         start = max(1, min(start, len(assignments)))
         active = assignments[start - 1:]
         # Reset row states: mark skipped ones before the start, others Pending.
@@ -688,8 +1901,63 @@ class App(ctk.CTk):
             messagebox.showinfo("No selection", "Select a row in the table first.")
             return
         num = self.run_tree.set(sel[0], "num")
-        self.start_entry.delete(0, "end")
-        self.start_entry.insert(0, str(num))
+        try:
+            self._set_run_start_position(int(num))
+        except (ValueError, TypeError):
+            pass
+
+    def _selected_run_account_ids(self) -> list[int]:
+        """Account ids for the currently-selected rows in the Run Picks table."""
+        ids = []
+        for iid in self.run_tree.selection():
+            if iid.startswith("acc"):
+                try:
+                    ids.append(int(iid[3:]))
+                except ValueError:
+                    pass
+        return ids
+
+    def on_run_reset_and_login(self):
+        """From the Run Picks table: wipe the selected accounts' profiles and log
+        them back in fresh with their saved email/password."""
+        if self.run_thread and self.run_thread.is_alive():
+            messagebox.showinfo(
+                "Run in progress",
+                "Stop the run first - the account profiles are in use while a run "
+                "is going.",
+            )
+            return
+        if self.assist_thread and self.assist_thread.is_alive():
+            messagebox.showinfo("Busy", "A login run is already in progress.")
+            return
+        ids = self._selected_run_account_ids()
+        if not ids:
+            messagebox.showinfo(
+                "No selection",
+                "Select one or more account rows in the table first "
+                "(Ctrl/Shift-click for multiple).",
+            )
+            return
+        if not messagebox.askyesno(
+            "Reset & log in",
+            f"Wipe the saved browser profile for {len(ids)} selected account(s) and "
+            "then log them in fresh using their saved email + password?\n\n"
+            "Use this on accounts that show green but refresh/fail on submit "
+            "(stale session). Each browser auto-fills the login - clear the captcha "
+            "if one appears.",
+        ):
+            return
+        targets = []
+        for i in ids:
+            acc = self.repo.get_account(i, include_password=False)
+            if acc is not None:
+                targets.append((i, acc.profile_dir))
+        self.run_reset_login_btn.configure(state="disabled", text="Resetting...")
+        for i in ids:
+            self._update_run_row(i, "Resetting profile + logging in fresh...", "busy", remember=False)
+        threading.Thread(
+            target=self._reset_profiles_worker, args=(targets, True), daemon=True
+        ).start()
 
     def on_watch_selected(self):
         if self.run_thread and self.run_thread.is_alive():
@@ -803,22 +2071,51 @@ class App(ctk.CTk):
     # ================================================================== #
     def _build_history_tab(self, tab) -> None:
         tab.grid_columnconfigure(0, weight=1)
-        tab.grid_rowconfigure(1, weight=1)
+        tab.grid_rowconfigure(2, weight=1)
         bar = ctk.CTkFrame(tab, fg_color="transparent")
-        bar.grid(row=0, column=0, sticky="ew", padx=PAD, pady=PAD)
-        ctk.CTkButton(bar, text="Refresh", command=self.refresh_history).pack(side="left", padx=4)
+        bar.grid(row=0, column=0, sticky="ew", padx=PAD, pady=(PAD, 2))
+        ctk.CTkButton(bar, text="Refresh", width=80, command=self.refresh_history).pack(side="left", padx=4)
+        ctk.CTkButton(bar, text="Delete selected", width=110, fg_color="#7a2e2e",
+                      hover_color="#8f3636", command=self.on_delete_selected_history).pack(side="left", padx=4)
+        ctk.CTkButton(bar, text="Delete all failed", width=120, fg_color="#7a2e2e",
+                      hover_color="#8f3636", command=self.on_delete_failed_history).pack(side="left", padx=4)
+        ctk.CTkButton(bar, text="Mark selected as success", width=160, fg_color="#2c6e49",
+                      hover_color="#358257", command=self.on_mark_history_success).pack(side="left", padx=4)
         self.history_count = ctk.CTkLabel(bar, text="")
         self.history_count.pack(side="left", padx=12)
+        ctk.CTkLabel(
+            bar, text="(double-click a row to see the full 5)", text_color=FG_MUTED,
+        ).pack(side="left", padx=8)
+
+        # Filter row: match by any of the 5 positions and/or the wildcard.
+        # Blank boxes are ignored -- fill only the ones you care about (e.g. just
+        # the wildcard, or just 1st + wildcard).
+        filt = ctk.CTkFrame(tab, fg_color="transparent")
+        filt.grid(row=1, column=0, sticky="ew", padx=PAD, pady=(0, 2))
+        ctk.CTkLabel(filt, text="Filter:", text_color=FG_MUTED).pack(side="left", padx=(4, 6))
+        self.hist_filter_pos = []
+        for lbl in ("1st", "2nd", "3rd", "4th", "5th"):
+            ctk.CTkLabel(filt, text=lbl, text_color=FG_MUTED).pack(side="left", padx=(4, 1))
+            e = ctk.CTkEntry(filt, width=88, placeholder_text="rider")
+            e.pack(side="left", padx=(0, 2))
+            self.hist_filter_pos.append(e)
+        ctk.CTkLabel(filt, text="Wildcard", text_color=FG_MUTED).pack(side="left", padx=(10, 1))
+        self.hist_filter_wc = ctk.CTkEntry(filt, width=110, placeholder_text="wildcard rider")
+        self.hist_filter_wc.pack(side="left", padx=(0, 2))
+        ctk.CTkButton(filt, text="Apply filter", width=90, command=self.refresh_history).pack(side="left", padx=4)
+        ctk.CTkButton(filt, text="Clear", width=60, command=self.on_clear_history_filter).pack(side="left", padx=2)
 
         wrap = tk.Frame(tab, bg="#242424")
-        wrap.grid(row=1, column=0, sticky="nsew", padx=PAD, pady=PAD)
+        wrap.grid(row=2, column=0, sticky="nsew", padx=PAD, pady=PAD)
         wrap.grid_rowconfigure(0, weight=1)
         wrap.grid_columnconfigure(0, weight=1)
-        cols = ("time", "account", "lineup", "wildcard", "ok", "message")
-        self.history_tree = ttk.Treeview(wrap, columns=cols, show="headings")
+
+        cols = ("time", "account", "lineup", "core", "wildcard", "ok", "message")
+        self.history_tree = ttk.Treeview(wrap, columns=cols, show="headings", selectmode="extended")
         for c, w, t in [
-            ("time", 140, "Time"), ("account", 150, "Account"), ("lineup", 80, "Lineup"),
-            ("wildcard", 150, "Wildcard"), ("ok", 70, "Result"), ("message", 380, "Message"),
+            ("time", 130, "Time"), ("account", 130, "Account"), ("lineup", 60, "Lineup"),
+            ("core", 300, "Top 5 (1st\u21925th)"), ("wildcard", 130, "Wildcard"),
+            ("ok", 60, "Result"), ("message", 300, "Message"),
         ]:
             self.history_tree.heading(c, text=t)
             self.history_tree.column(c, width=w, anchor="w")
@@ -826,21 +2123,134 @@ class App(ctk.CTk):
         self.history_tree.configure(yscrollcommand=vsb.set)
         self.history_tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
-        self.history_tree.tag_configure("ok", foreground="#7fdf7f")
-        self.history_tree.tag_configure("fail", foreground="#ff8a8a")
+        self.history_tree.tag_configure("ok", foreground=ROW_OK)
+        self.history_tree.tag_configure("fail", foreground=ROW_FAIL)
+        # Remember each row's full details for the double-click popup.
+        self._history_by_iid: dict[str, object] = {}
+        self.history_tree.bind("<Double-1>", lambda e: self._show_history_detail())
+
+    def _history_matches_filter(self, e) -> bool:
+        """True if a submission matches the (optional) wildcard + position boxes.
+        Blank boxes are ignored; a filled box must be a case-insensitive substring
+        match of that position's rider (or the wildcard)."""
+        if not hasattr(self, "hist_filter_wc"):
+            return True
+        wc = self.hist_filter_wc.get().strip().lower()
+        if wc and wc not in (e.wildcard or "").lower():
+            return False
+        wants = [box.get().strip().lower() for box in self.hist_filter_pos]
+        if any(wants):
+            riders = [r.strip().lower() for r in (e.core_five or "").split(",")]
+            for i, want in enumerate(wants):
+                if not want:
+                    continue
+                if i >= len(riders) or want not in riders[i]:
+                    return False
+        return True
 
     def refresh_history(self):
         for iid in self.history_tree.get_children():
             self.history_tree.delete(iid)
+        self._history_by_iid = {}
         logs = self.repo.list_submission_logs()
-        for e in logs:
+        shown = 0
+        for i, e in enumerate(logs):
+            if not self._history_matches_filter(e):
+                continue
+            iid = f"hist{i}"
+            self._history_by_iid[iid] = e
             self.history_tree.insert(
-                "", "end",
-                values=(e.timestamp, e.account_label, f"#{e.round_number}", e.wildcard,
+                "", "end", iid=iid,
+                values=(e.timestamp, e.account_label, f"#{e.round_number}",
+                        e.core_five or "(not recorded)", e.wildcard,
                         "OK" if e.success else "FAIL", e.message),
                 tags=("ok" if e.success else "fail",),
             )
-        self.history_count.configure(text=f"{len(logs)} submissions")
+            shown += 1
+        total = len(logs)
+        if shown != total:
+            self.history_count.configure(text=f"{shown} of {total} submissions (filtered)")
+        else:
+            self.history_count.configure(text=f"{total} submissions")
+
+    def on_clear_history_filter(self):
+        for box in self.hist_filter_pos:
+            box.delete(0, "end")
+        self.hist_filter_wc.delete(0, "end")
+        self.refresh_history()
+
+    def on_delete_selected_history(self):
+        sel = self.history_tree.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select one or more history rows to delete.")
+            return
+        ids = []
+        for iid in sel:
+            e = self._history_by_iid.get(iid)
+            if e is not None and e.id is not None:
+                ids.append(e.id)
+        if not ids:
+            return
+        if not messagebox.askyesno(
+            "Delete history", f"Delete {len(ids)} selected history entr(y/ies)? This can't be undone."
+        ):
+            return
+        self.repo.delete_submission_logs(ids)
+        self.refresh_history()
+
+    def on_mark_history_success(self):
+        sel = self.history_tree.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select one or more history rows to mark as success.")
+            return
+        ids = []
+        for iid in sel:
+            e = self._history_by_iid.get(iid)
+            if e is not None and e.id is not None:
+                ids.append(e.id)
+        if not ids:
+            return
+        n = self.repo.set_submission_logs_success(ids, True)
+        self.refresh_history()
+        self.history_count.configure(
+            text=self.history_count.cget("text") + f"  (marked {n} as success)"
+        )
+
+    def on_delete_failed_history(self):
+        if not messagebox.askyesno(
+            "Delete failed",
+            "Delete ALL failed (FAIL) submissions from history, leaving only the "
+            "successful (green) ones?\n\nThis can't be undone.",
+        ):
+            return
+        n = self.repo.delete_failed_submission_logs()
+        self.refresh_history()
+        messagebox.showinfo("Deleted", f"Removed {n} failed submission(s) from history.")
+
+    def _show_history_detail(self):
+        sel = self.history_tree.selection()
+        if not sel:
+            return
+        e = self._history_by_iid.get(sel[0])
+        if e is None:
+            return
+        riders = [r.strip() for r in (e.core_five or "").split(",") if r.strip()]
+        if riders:
+            places = ["1st", "2nd", "3rd", "4th", "5th"]
+            lines = [f"  {places[i] if i < len(places) else str(i + 1) + 'th'}: {r}"
+                     for i, r in enumerate(riders)]
+            core_txt = "\n".join(lines)
+        else:
+            core_txt = "  (the 5 riders weren't recorded for this entry)"
+        messagebox.showinfo(
+            f"Lineup #{e.round_number} - {e.account_label}",
+            f"Account: {e.account_label} ({e.account_email})\n"
+            f"Submitted: {e.timestamp}\n"
+            f"Result: {'OK' if e.success else 'FAIL'}\n\n"
+            f"Top 5 (core):\n{core_txt}\n\n"
+            f"Wild card (13th): {e.wildcard}\n\n"
+            f"{e.message}",
+        )
 
     # ================================================================== #
     # Persistence of round inputs
@@ -848,6 +2258,12 @@ class App(ctk.CTk):
     def _persist_round(self):
         self.repo.set_meta("round_lineups_text", self.lineups_box.get("1.0", "end").strip())
         self.repo.set_meta("round_wildcards_text", self.wildcards_box.get("1.0", "end").strip())
+        # Remember which account the round starts at (by id, so it survives
+        # reordering / re-import as long as that account still exists).
+        accounts = self._round_accounts or self.repo.list_accounts()
+        off = self._selected_start_offset()
+        if accounts and 0 <= off < len(accounts):
+            self.repo.set_meta("round_start_account_id", str(accounts[off].id))
 
     def _persist_plan(self):
         if self.plan:
@@ -939,6 +2355,157 @@ class App(ctk.CTk):
         elif kind == "run_error":
             self._on_run_finished()
             messagebox.showerror("Run error", evt[1])
+        elif kind == "su_task_start":
+            self._su_update_row(evt[1], "Starting...", "busy")
+        elif kind == "su_status":
+            self._su_update_row(evt[1], evt[2], "busy")
+        elif kind == "su_result":
+            r: SignupResult = evt[1]
+            tag = "ok" if r.success else ("skip" if "skipped" in r.message.lower() else "fail")
+            self._su_update_row(r.email, r.message, tag)
+            if r.success and r.password:
+                self._append_signup_file(r.email, r.password)
+                self.refresh_accounts()
+        elif kind == "su_progress":
+            done, total = evt[1], evt[2]
+            self.signup_progress.set(done / total if total else 0)
+            self.signup_progress_lbl.configure(text=f"{done} / {total}")
+        elif kind == "su_run_done":
+            self._on_signup_finished()
+        elif kind == "su_run_error":
+            self._on_signup_finished()
+            messagebox.showerror("Sign-up error", evt[1])
+        elif kind == "proxy_ip":
+            self.test_proxy_btn.configure(state="normal", text="Test proxy")
+            self.signup_status_lbl.configure(text=f"Proxy public IP: {evt[1]}")
+            messagebox.showinfo(
+                "Proxy test",
+                f"The browser's public IP through the proxy was:\n\n{evt[1]}\n\n"
+                "If this is NOT your normal home IP, the proxy is working.",
+            )
+        elif kind == "proxy_err":
+            self.test_proxy_btn.configure(state="normal", text="Test proxy")
+            self.signup_status_lbl.configure(text="Proxy test failed.")
+            messagebox.showerror(
+                "Proxy test failed",
+                f"Could not load a page through the proxy:\n\n{evt[1]}\n\n"
+                "Check the host:port:user:pass and that the proxy is active.",
+            )
+        elif kind == "debug_dump":
+            self.debug_form_btn.configure(state="normal", text="Debug form")
+            path, report = evt[1], evt[2]
+            self.signup_status_lbl.configure(text=f"Form dump written to: {path}")
+            head = report[:1200] + ("\n... (full dump in the file above)" if len(report) > 1200 else "")
+            messagebox.showinfo(
+                "Sign-up form dump",
+                f"Saved the form's buttons + fields to:\n{path}\n\n"
+                f"Open that file and share it with me.\n\n{head}",
+            )
+        elif kind == "debug_err":
+            self.debug_form_btn.configure(state="normal", text="Debug form")
+            self.signup_status_lbl.configure(text="Form dump failed.")
+            messagebox.showerror("Debug form failed", str(evt[1]))
+        elif kind == "picks_dump":
+            self.debug_picks_btn.configure(state="normal", text="Debug picks")
+            path, report = evt[1], evt[2]
+            self.accounts_status.configure(text=f"Picks page dump written to: {path}")
+            head = report[:1500] + ("\n... (full dump in the file above)" if len(report) > 1500 else "")
+            messagebox.showinfo(
+                "Picks page dump",
+                f"Saved the picks page's login state, dropdowns, buttons, and "
+                f"submit/success markers to:\n{path}\n\nOpen that file and share it "
+                f"with me.\n\n{head}",
+            )
+        elif kind == "picks_dump_err":
+            self.debug_picks_btn.configure(state="normal", text="Debug picks")
+            self.accounts_status.configure(text="Picks page dump failed.")
+            messagebox.showerror("Debug picks failed", str(evt[1]))
+        elif kind == "free_disk_done":
+            self.free_disk_btn.configure(state="normal", text="Free up disk (clear caches)")
+            count, freed = evt[1], evt[2]
+            mb = freed / (1024 * 1024)
+            gb = mb / 1024
+            human = f"{gb:.2f} GB" if mb >= 1024 else f"{mb:.0f} MB"
+            self.accounts_status.configure(
+                text=f"Cleared caches from {count} profile(s) - freed {human}."
+            )
+            messagebox.showinfo(
+                "Disk freed",
+                f"Cleared browser caches from {count} profile(s) and freed about "
+                f"{human}.\n\nNo one was logged out - Chrome will rebuild the cache "
+                f"as needed.",
+            )
+        elif kind == "free_disk_err":
+            self.free_disk_btn.configure(state="normal", text="Free up disk (clear caches)")
+            self.accounts_status.configure(text="Clearing caches failed.")
+            messagebox.showerror("Free up disk failed", str(evt[1]))
+        elif kind == "reset_profiles_done":
+            self.reset_profile_btn.configure(state="normal", text="Reset profile (fresh login)")
+            self.reset_login_btn.configure(state="normal", text="Reset & log in (auto-fill)")
+            if hasattr(self, "run_reset_login_btn"):
+                self.run_reset_login_btn.configure(state="normal", text="Reset & log in")
+            done_ids, then_login = evt[1], evt[2]
+            # DB writes happen here on the UI thread (SQLite is single-thread).
+            for aid in done_ids:
+                try:
+                    self.repo.set_session_valid(aid, False)
+                except Exception:  # noqa: BLE001
+                    pass
+            self.refresh_accounts()
+            if then_login and done_ids:
+                self.accounts_status.configure(
+                    text=f"Reset {len(done_ids)} profile(s) - logging them in fresh..."
+                )
+                self._begin_assist_login(done_ids)
+            else:
+                self.accounts_status.configure(
+                    text=f"Reset {len(done_ids)} profile(s) - now log them in fresh (Open in Chrome / auto-fill)."
+                )
+                messagebox.showinfo(
+                    "Profiles reset",
+                    f"Wiped {len(done_ids)} profile(s) and marked them logged out.\n\n"
+                    f"Now log them in fresh: select them and use 'Open selected in "
+                    f"Chrome' (or 'Log in selected (auto-fill)'). The fresh session "
+                    f"will persist, and picks should then submit.",
+                )
+        elif kind == "sl_status":
+            acc = self.repo.get_account(evt[1], include_password=False)
+            label = acc.label if acc else f"#{evt[1]}"
+            self.accounts_status.configure(text=f"[{label}] {evt[2]}")
+        elif kind == "sl_result":
+            self.refresh_accounts()
+        elif kind == "sl_progress":
+            self.accounts_status.configure(text=f"Auto-fill login... {evt[1]}/{evt[2]}")
+        elif kind == "sl_done":
+            self.assist_login_btn.configure(state="normal", text="Log in selected (auto-fill)")
+            self.assist_stop_btn.configure(state="disabled", text="Stop")
+            self.refresh_accounts()
+            self.accounts_status.configure(text="Auto-fill login run finished.")
+        elif kind == "sl_error":
+            self.assist_login_btn.configure(state="normal", text="Log in selected (auto-fill)")
+            self.assist_stop_btn.configure(state="disabled", text="Stop")
+            self.refresh_accounts()
+            messagebox.showerror("Login error", str(evt[1]))
+        elif kind == "chrome_opened":
+            self.accounts_status.configure(
+                text=f"Opened {evt[1]} Chrome window(s). Log in, close them, then "
+                     f"click 'Refresh login status'."
+            )
+        elif kind == "si_result":
+            self.refresh_accounts()
+        elif kind == "si_progress":
+            self.accounts_status.configure(text=f"Verifying logins... {evt[1]}/{evt[2]}")
+        elif kind == "si_done":
+            self.refresh_logins_btn.configure(state="normal", text="Refresh login status")
+            self.open_chrome_btn.configure(state="normal")
+            self.refresh_accounts()
+            valid = sum(1 for a in self.repo.list_accounts() if a.session_valid)
+            self.accounts_status.configure(text=f"Login check done. {valid} account(s) logged in.")
+        elif kind == "si_error":
+            self.refresh_logins_btn.configure(state="normal", text="Refresh login status")
+            self.open_chrome_btn.configure(state="normal")
+            self.refresh_accounts()
+            messagebox.showerror("Login check error", str(evt[1]))
 
     def _update_run_row(self, account_id: int, status: str, tag: str, remember: bool = True):
         iid = self._run_row_by_account.get(account_id)
@@ -956,6 +2523,17 @@ class App(ctk.CTk):
         self.refresh_accounts()
         self.refresh_history()
 
+    def _on_signup_finished(self):
+        self._set_signup_running(False)
+        self.refresh_accounts()
+        n = sum(
+            1 for iid in self.signup_tree.get_children()
+            if "ok" in (self.signup_tree.item(iid, "tags") or ())
+        )
+        self.signup_status_lbl.configure(
+            text=f"Done. {n} new account(s) saved to {config.SIGNUPS_PATH}"
+        )
+
     def _on_close(self):
         try:
             # Stop the event pump so no pending timer fires after destroy().
@@ -966,6 +2544,12 @@ class App(ctk.CTk):
                     pass
             if self.runner:
                 self.runner.cancel()
+            if self.signup_runner:
+                self.signup_runner.cancel()
+            if self.signin_runner:
+                self.signin_runner.cancel()
+            if self.assist_runner:
+                self.assist_runner.cancel()
             # Persist the round so nothing is lost on close (cleared only by Reset round).
             self._persist_round()
             self._persist_plan()

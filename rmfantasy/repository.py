@@ -101,8 +101,12 @@ class Repository:
         )
 
     def list_accounts(self, include_password: bool = False) -> list[Account]:
+        # Stable ADD ORDER (id ASC = creation order): accounts always appear in
+        # the order they were created/imported, so newly added or signed-up
+        # accounts land at the BOTTOM of the list -- even once they're signed in
+        # -- and the list never reshuffles when a login status changes.
         rows = self.conn.execute(
-            "SELECT * FROM accounts ORDER BY label COLLATE NOCASE"
+            "SELECT * FROM accounts ORDER BY id ASC"
         ).fetchall()
         return [self._row_to_account(r, include_password) for r in rows]
 
@@ -145,6 +149,12 @@ class Repository:
 
     def count_accounts(self) -> int:
         return self.conn.execute("SELECT COUNT(*) AS c FROM accounts").fetchone()["c"]
+
+    def email_exists(self, email: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM accounts WHERE email = ? COLLATE NOCASE", (email.strip(),)
+        ).fetchone()
+        return row is not None
 
     def clear_all_accounts(self) -> int:
         """Delete every account (and cascaded assignments/rotation state).
@@ -277,7 +287,7 @@ class Repository:
         """
         for key in (
             "round_lineups_text", "round_wildcards_text",
-            "round_plan_json", "round_status_json",
+            "round_plan_json", "round_status_json", "round_start_account_id",
         ):
             self.conn.execute("DELETE FROM meta WHERE key = ?", (key,))
         self.conn.execute("DELETE FROM submission_log")
@@ -466,6 +476,36 @@ class Repository:
         )
         self.conn.commit()
         return cur.lastrowid
+
+    def delete_submission_log(self, log_id: int) -> None:
+        self.conn.execute("DELETE FROM submission_log WHERE id = ?", (log_id,))
+        self.conn.commit()
+
+    def delete_submission_logs(self, log_ids: list[int]) -> int:
+        if not log_ids:
+            return 0
+        placeholders = ",".join("?" for _ in log_ids)
+        cur = self.conn.execute(
+            f"DELETE FROM submission_log WHERE id IN ({placeholders})", tuple(log_ids)
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    def delete_failed_submission_logs(self) -> int:
+        cur = self.conn.execute("DELETE FROM submission_log WHERE success = 0")
+        self.conn.commit()
+        return cur.rowcount
+
+    def set_submission_logs_success(self, log_ids: list[int], success: bool) -> int:
+        if not log_ids:
+            return 0
+        placeholders = ",".join("?" for _ in log_ids)
+        cur = self.conn.execute(
+            f"UPDATE submission_log SET success = ? WHERE id IN ({placeholders})",
+            (1 if success else 0, *log_ids),
+        )
+        self.conn.commit()
+        return cur.rowcount
 
     def list_submission_logs(self, limit: int = 500) -> list[SubmissionLog]:
         rows = self.conn.execute(

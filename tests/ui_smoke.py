@@ -91,12 +91,88 @@ sd.entry.insert(0, "99")
 sd._ok()
 print("start dialog clamp (expect 8):", sd.result)
 
+# --- Start-at-account dropdown: pick the 5th account, rebuild, verify offset ---
+app2._refresh_start_at_choices()
+choices = app2.start_at_combo.all_values()
+print("start-at choices count (expect 16):", len(choices))
+app2.start_at_combo.set(choices[4])            # 5th account
+off = app2._selected_start_offset()
+print("start-at offset (expect 4):", off)
+accs = app2.repo.list_accounts()
+p_off = build_plan([["a", "b", "c", "d", "e"]], ["W0", "W1", "W2"], accs, off)
+print("start-at first acct == 5th:", p_off.assignments[0].account_label == accs[4].label)
+print("start-at skipped_before (expect 4):", p_off.skipped_before)
+# Free-typed substring should still resolve to an account line.
+app2.start_at_combo.set(accs[7].label)
+print("start-at substring offset (expect 7):", app2._selected_start_offset())
+# Run Picks within-plan skip dropdown parses the leading position number.
+app2.plan = build_plan(
+    [["a", "b", "c", "d", "e"], ["f", "g", "h", "i", "j"]], ["W0", "W1"], accs)
+app2._populate_run_table()
+app2._set_run_start_position(3)
+print("run-start position parsed (expect 3):", app2._selected_run_start_position())
+
 # --- Reset round: clears round + history, keeps accounts. ---
 app2.on_reset_round()
 print("after reset: plan:", app2.plan)
 print("after reset: run rows:", len(app2.run_tree.get_children()))
 print("after reset: accounts kept:", app2.repo.count_accounts())
 print("after reset: alias kept:", app2.repo.get_aliases())
+
+# --- Sign Up flow (browser + site mocked; no real Chrome) ---
+import contextlib
+from rmfantasy import runner as _runnermod
+from rmfantasy.automation import SignupError as _SignupError
+from rmfantasy.signup import generate_identity
+
+
+@contextlib.contextmanager
+def _fake_session(profile_dir, headless=False, proxy=None):
+    yield object()
+
+
+def _fake_do_signup(driver, profile, status_cb=None, timeout=30, post_submit_dwell=0,
+                    submit_attempts=6, submit_retry_delay=0):
+    if status_cb:
+        status_cb("mock: filling form")
+    if profile.email.startswith("fail"):
+        raise _SignupError("mock: form not found")
+
+
+_runnermod.automation.chrome_session = _fake_session
+_runnermod.automation.do_signup = _fake_do_signup
+
+before = app2.repo.count_accounts()
+sr = _runnermod.SignupRunner(
+    city="Provo", state="Utah", postal_code="84601",
+    concurrency=1, launch_stagger=0, post_submit_dwell=0, assist=False,
+)
+results = {r.email: r for r in sr.run(["new1@ex.com", "fail2@ex.com", "user0@ex.com"])}
+print("signup success (expect True):",
+      results["new1@ex.com"].success and bool(results["new1@ex.com"].password))
+print("signup failure (expect False):", results["fail2@ex.com"].success)
+print("signup skip existing (expect True):", "skip" in results["user0@ex.com"].message.lower())
+print("accounts delta (expect 1):", app2.repo.count_accounts() - before)
+_accts = {a.email: a for a in app2.repo.list_accounts()}
+# Successful signups are marked logged in (the signup saved the session).
+print("new account signed in (expect True):", _accts["new1@ex.com"].session_valid)
+app2._append_signup_file("new1@ex.com", results["new1@ex.com"].password)
+print("signups file has line (expect True):",
+      "new1@ex.com" in open(appmod.config.SIGNUPS_PATH).read())
+_idn = generate_identity()
+print("identity generated (expect True):",
+      all([_idn.first_name, _idn.last_name, _idn.phone, _idn.nickname, len(_idn.password) >= 10]))
+
+# --- Assisted sign-in (mocked browser) marks the account session-valid ---
+_runnermod.automation.assist_login = (
+    lambda driver, email, password, status_cb=None, timeout=30, wait_timeout=600:
+    status_cb("mock: logged in") if status_cb else None
+)
+_target = app2.repo.list_accounts()[-1]           # a not-signed-in one (bottom)
+app2.repo.set_session_valid(_target.id, False)
+_runnermod.SigninRunner([_target.id], concurrency=1, launch_stagger=0).run()
+_after = {a.id: a for a in app2.repo.list_accounts()}
+print("assist sign-in marks valid (expect True):", _after[_target.id].session_valid)
 
 app2.update()
 app2.after(50, app2.destroy)
