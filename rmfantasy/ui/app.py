@@ -2071,23 +2071,45 @@ class App(ctk.CTk):
     # ================================================================== #
     def _build_history_tab(self, tab) -> None:
         tab.grid_columnconfigure(0, weight=1)
-        tab.grid_rowconfigure(1, weight=1)
+        tab.grid_rowconfigure(2, weight=1)
         bar = ctk.CTkFrame(tab, fg_color="transparent")
-        bar.grid(row=0, column=0, sticky="ew", padx=PAD, pady=PAD)
-        ctk.CTkButton(bar, text="Refresh", command=self.refresh_history).pack(side="left", padx=4)
+        bar.grid(row=0, column=0, sticky="ew", padx=PAD, pady=(PAD, 2))
+        ctk.CTkButton(bar, text="Refresh", width=80, command=self.refresh_history).pack(side="left", padx=4)
+        ctk.CTkButton(bar, text="Delete selected", width=110, fg_color="#7a2e2e",
+                      hover_color="#8f3636", command=self.on_delete_selected_history).pack(side="left", padx=4)
+        ctk.CTkButton(bar, text="Delete all failed", width=120, fg_color="#7a2e2e",
+                      hover_color="#8f3636", command=self.on_delete_failed_history).pack(side="left", padx=4)
         self.history_count = ctk.CTkLabel(bar, text="")
         self.history_count.pack(side="left", padx=12)
-
-        wrap = tk.Frame(tab, bg="#242424")
-        wrap.grid(row=1, column=0, sticky="nsew", padx=PAD, pady=PAD)
-        wrap.grid_rowconfigure(0, weight=1)
-        wrap.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             bar, text="(double-click a row to see the full 5)", text_color=FG_MUTED,
         ).pack(side="left", padx=8)
 
+        # Filter row: match by any of the 5 positions and/or the wildcard.
+        # Blank boxes are ignored -- fill only the ones you care about (e.g. just
+        # the wildcard, or just 1st + wildcard).
+        filt = ctk.CTkFrame(tab, fg_color="transparent")
+        filt.grid(row=1, column=0, sticky="ew", padx=PAD, pady=(0, 2))
+        ctk.CTkLabel(filt, text="Filter:", text_color=FG_MUTED).pack(side="left", padx=(4, 6))
+        self.hist_filter_pos = []
+        for lbl in ("1st", "2nd", "3rd", "4th", "5th"):
+            ctk.CTkLabel(filt, text=lbl, text_color=FG_MUTED).pack(side="left", padx=(4, 1))
+            e = ctk.CTkEntry(filt, width=88, placeholder_text="rider")
+            e.pack(side="left", padx=(0, 2))
+            self.hist_filter_pos.append(e)
+        ctk.CTkLabel(filt, text="Wildcard", text_color=FG_MUTED).pack(side="left", padx=(10, 1))
+        self.hist_filter_wc = ctk.CTkEntry(filt, width=110, placeholder_text="wildcard rider")
+        self.hist_filter_wc.pack(side="left", padx=(0, 2))
+        ctk.CTkButton(filt, text="Apply filter", width=90, command=self.refresh_history).pack(side="left", padx=4)
+        ctk.CTkButton(filt, text="Clear", width=60, command=self.on_clear_history_filter).pack(side="left", padx=2)
+
+        wrap = tk.Frame(tab, bg="#242424")
+        wrap.grid(row=2, column=0, sticky="nsew", padx=PAD, pady=PAD)
+        wrap.grid_rowconfigure(0, weight=1)
+        wrap.grid_columnconfigure(0, weight=1)
+
         cols = ("time", "account", "lineup", "core", "wildcard", "ok", "message")
-        self.history_tree = ttk.Treeview(wrap, columns=cols, show="headings")
+        self.history_tree = ttk.Treeview(wrap, columns=cols, show="headings", selectmode="extended")
         for c, w, t in [
             ("time", 130, "Time"), ("account", 130, "Account"), ("lineup", 60, "Lineup"),
             ("core", 300, "Top 5 (1st\u21925th)"), ("wildcard", 130, "Wildcard"),
@@ -2105,12 +2127,34 @@ class App(ctk.CTk):
         self._history_by_iid: dict[str, object] = {}
         self.history_tree.bind("<Double-1>", lambda e: self._show_history_detail())
 
+    def _history_matches_filter(self, e) -> bool:
+        """True if a submission matches the (optional) wildcard + position boxes.
+        Blank boxes are ignored; a filled box must be a case-insensitive substring
+        match of that position's rider (or the wildcard)."""
+        if not hasattr(self, "hist_filter_wc"):
+            return True
+        wc = self.hist_filter_wc.get().strip().lower()
+        if wc and wc not in (e.wildcard or "").lower():
+            return False
+        wants = [box.get().strip().lower() for box in self.hist_filter_pos]
+        if any(wants):
+            riders = [r.strip().lower() for r in (e.core_five or "").split(",")]
+            for i, want in enumerate(wants):
+                if not want:
+                    continue
+                if i >= len(riders) or want not in riders[i]:
+                    return False
+        return True
+
     def refresh_history(self):
         for iid in self.history_tree.get_children():
             self.history_tree.delete(iid)
         self._history_by_iid = {}
         logs = self.repo.list_submission_logs()
+        shown = 0
         for i, e in enumerate(logs):
+            if not self._history_matches_filter(e):
+                continue
             iid = f"hist{i}"
             self._history_by_iid[iid] = e
             self.history_tree.insert(
@@ -2120,7 +2164,48 @@ class App(ctk.CTk):
                         "OK" if e.success else "FAIL", e.message),
                 tags=("ok" if e.success else "fail",),
             )
-        self.history_count.configure(text=f"{len(logs)} submissions")
+            shown += 1
+        total = len(logs)
+        if shown != total:
+            self.history_count.configure(text=f"{shown} of {total} submissions (filtered)")
+        else:
+            self.history_count.configure(text=f"{total} submissions")
+
+    def on_clear_history_filter(self):
+        for box in self.hist_filter_pos:
+            box.delete(0, "end")
+        self.hist_filter_wc.delete(0, "end")
+        self.refresh_history()
+
+    def on_delete_selected_history(self):
+        sel = self.history_tree.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select one or more history rows to delete.")
+            return
+        ids = []
+        for iid in sel:
+            e = self._history_by_iid.get(iid)
+            if e is not None and e.id is not None:
+                ids.append(e.id)
+        if not ids:
+            return
+        if not messagebox.askyesno(
+            "Delete history", f"Delete {len(ids)} selected history entr(y/ies)? This can't be undone."
+        ):
+            return
+        self.repo.delete_submission_logs(ids)
+        self.refresh_history()
+
+    def on_delete_failed_history(self):
+        if not messagebox.askyesno(
+            "Delete failed",
+            "Delete ALL failed (FAIL) submissions from history, leaving only the "
+            "successful (green) ones?\n\nThis can't be undone.",
+        ):
+            return
+        n = self.repo.delete_failed_submission_logs()
+        self.refresh_history()
+        messagebox.showinfo("Deleted", f"Removed {n} failed submission(s) from history.")
 
     def _show_history_detail(self):
         sel = self.history_tree.selection()

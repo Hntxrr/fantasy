@@ -1193,15 +1193,12 @@ def submit_picks(
         return
     if status_cb:
         status_cb("Confirming...")
-    # If the submit bounced the page to a logged-out state, it did NOT save --
-    # this is the "refresh that eats the picks" on accounts whose session wasn't
-    # truly established.
-    if not is_logged_in(driver):
-        raise SubmissionError(
-            "The page reset to a logged-out state right after submitting, so the "
-            "picks were not saved. Log this account in first (its session wasn't "
-            "fully established), then retry."
-        )
+    # NOTE: we do NOT gate success on is_logged_in() here. After a successful
+    # submit this site locks/re-renders the rider dropdowns, so is_logged_in()
+    # (which looks for EDITABLE dropdowns) flips to False even though the picks
+    # saved -- that was causing false 'failed' results. A genuinely logged-out
+    # account fails earlier (no Submit button to click), so confirming via the
+    # site's success markers is enough.
     if not confirm_success(driver):
         raise SubmissionError(
             "Submitted but no confirmation detected. Verify SUBMIT_SUCCESS_* "

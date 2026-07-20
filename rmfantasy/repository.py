@@ -477,6 +477,25 @@ class Repository:
         self.conn.commit()
         return cur.lastrowid
 
+    def delete_submission_log(self, log_id: int) -> None:
+        self.conn.execute("DELETE FROM submission_log WHERE id = ?", (log_id,))
+        self.conn.commit()
+
+    def delete_submission_logs(self, log_ids: list[int]) -> int:
+        if not log_ids:
+            return 0
+        placeholders = ",".join("?" for _ in log_ids)
+        cur = self.conn.execute(
+            f"DELETE FROM submission_log WHERE id IN ({placeholders})", tuple(log_ids)
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    def delete_failed_submission_logs(self) -> int:
+        cur = self.conn.execute("DELETE FROM submission_log WHERE success = 0")
+        self.conn.commit()
+        return cur.rowcount
+
     def list_submission_logs(self, limit: int = 500) -> list[SubmissionLog]:
         rows = self.conn.execute(
             "SELECT * FROM submission_log ORDER BY id DESC LIMIT ?", (limit,)
